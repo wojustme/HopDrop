@@ -43,7 +43,8 @@ android {
 
 dependencies {
     // gomobile 产出的绑定库（scripts/build-android.sh / CI 会把 hopdrop.aar 放到 libs/）。
-    implementation(name = "hopdrop", ext = "aar")
+    // 经由 settings.gradle.kts 里配置的 flatDir 仓库解析，需显式给出空 group。
+    implementation(group = "", name = "hopdrop", ext = "aar")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.1")
