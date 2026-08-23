@@ -169,7 +169,7 @@ func (c *Client) handleOffer(peer protocol.DeviceInfo, offer protocol.Offer) pro
 	c.mu.Unlock()
 
 	if c.cb != nil {
-		oj := OfferJSON{
+		oj := offerJSON{
 			Peer:       toPeerDevice(peer),
 			TotalBytes: offer.TotalBytes,
 		}
@@ -193,9 +193,9 @@ func (c *Client) emitPeers() {
 
 func (c *Client) peersJSON() string {
 	peers := c.node.Peers()
-	out := make([]PeerJSON, 0, len(peers))
+	out := make([]peerJSON, 0, len(peers))
 	for _, p := range peers {
-		out = append(out, PeerJSON{
+		out = append(out, peerJSON{
 			Device:   toPeerDevice(p.Device),
 			Addr:     p.Addr,
 			Endpoint: p.SyncEndpoint(),
@@ -209,7 +209,7 @@ func (c *Client) emitProgress(p syncpkg.Progress) {
 	if c.cb == nil {
 		return
 	}
-	pj := ProgressJSON{
+	pj := progressJSON{
 		Direction:   p.Direction,
 		PeerID:      p.PeerID,
 		PeerName:    p.PeerName,
@@ -275,7 +275,7 @@ func (a *sourceAdapter) List() ([]protocol.FileMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	var metas []FileMetaJSON
+	var metas []fileMetaJSON
 	if err := json.Unmarshal([]byte(js), &metas); err != nil {
 		return nil, err
 	}

@@ -4,24 +4,29 @@ import "github.com/xurenhe/hopdrop/core/protocol"
 
 // 本文件定义在 Go 与移动端宿主之间用 JSON 传递的数据结构（DTO）。
 // gomobile 不擅长跨语言传结构体切片/map，因此统一序列化成 JSON 字符串往返。
+//
+// 注意：这些类型刻意用小写（未导出）命名 —— 它们只在 Go 内部用于 json 编解码，
+// 不应被 gomobile 绑定成 Java/Swift 类；未导出可避免 gomobile 试图绑定含
+// []struct 字段（如 offerJSON.Files）时报“unsupported type”。字段仍为导出，
+// 以便 encoding/json 正常工作。
 
-// PeerDevice 是设备身份的可序列化形式。
-type PeerDevice struct {
+// peerDevice 是设备身份的可序列化形式。
+type peerDevice struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Platform string `json:"platform"`
 	SyncPort int    `json:"sync_port"`
 }
 
-// PeerJSON 是一台在线设备（含网络地址）的可序列化形式。
-type PeerJSON struct {
-	Device   PeerDevice `json:"device"`
+// peerJSON 是一台在线设备（含网络地址）的可序列化形式。
+type peerJSON struct {
+	Device   peerDevice `json:"device"`
 	Addr     string     `json:"addr"`
 	Endpoint string     `json:"endpoint"`
 }
 
-// FileMetaJSON 是文件元数据的可序列化形式。
-type FileMetaJSON struct {
+// fileMetaJSON 是文件元数据的可序列化形式。
+type fileMetaJSON struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	RelPath  string `json:"rel_path"`
@@ -30,15 +35,15 @@ type FileMetaJSON struct {
 	MimeType string `json:"mime_type,omitempty"`
 }
 
-// OfferJSON 是一次传输请求的可序列化形式，供宿主弹窗展示。
-type OfferJSON struct {
-	Peer       PeerDevice     `json:"peer"`
-	Files      []FileMetaJSON `json:"files"`
+// offerJSON 是一次传输请求的可序列化形式，供宿主弹窗展示。
+type offerJSON struct {
+	Peer       peerDevice     `json:"peer"`
+	Files      []fileMetaJSON `json:"files"`
 	TotalBytes int64          `json:"total_bytes"`
 }
 
-// ProgressJSON 是传输进度的可序列化形式。
-type ProgressJSON struct {
+// progressJSON 是传输进度的可序列化形式。
+type progressJSON struct {
 	Direction   string `json:"direction"`
 	PeerID      string `json:"peer_id"`
 	PeerName    string `json:"peer_name"`
@@ -51,8 +56,8 @@ type ProgressJSON struct {
 	Err         string `json:"err,omitempty"`
 }
 
-func toPeerDevice(d protocol.DeviceInfo) PeerDevice {
-	return PeerDevice{
+func toPeerDevice(d protocol.DeviceInfo) peerDevice {
+	return peerDevice{
 		ID:       d.ID,
 		Name:     d.Name,
 		Platform: string(d.Platform),
@@ -60,8 +65,8 @@ func toPeerDevice(d protocol.DeviceInfo) PeerDevice {
 	}
 }
 
-func toFileMeta(f protocol.FileMeta) FileMetaJSON {
-	return FileMetaJSON{
+func toFileMeta(f protocol.FileMeta) fileMetaJSON {
+	return fileMetaJSON{
 		ID:       f.ID,
 		Name:     f.Name,
 		RelPath:  f.RelPath,
@@ -71,7 +76,7 @@ func toFileMeta(f protocol.FileMeta) FileMetaJSON {
 	}
 }
 
-func fromFileMeta(m FileMetaJSON) protocol.FileMeta {
+func fromFileMeta(m fileMetaJSON) protocol.FileMeta {
 	return protocol.FileMeta{
 		ID:       m.ID,
 		Name:     m.Name,

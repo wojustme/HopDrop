@@ -1,19 +1,24 @@
-# 构建产物
+# 构建产物（仓库根下的可执行文件，用锚定路径避免误伤 cmd/hopdrop-gui 源码目录）
 /build/
 /dist/
-hopdrop
-hopdrop.exe
-hopdrop-gui
-hopdrop-gui.exe
+/hopdrop
+/hopdrop.exe
+/hopdrop-gui
+/hopdrop-gui.exe
 *.aar
 *.xcframework/
 *.ipa
 *.apk
 *.app/
 
+# Android 构建输出
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+
 # gomobile / cgo 中间产物
 *.o
-*.a
 
 # macOS
 .DS_Store
