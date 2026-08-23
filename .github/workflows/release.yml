@@ -1,0 +1,258 @@
+name: release
+
+# 触发方式：推送形如 v1.2.3 的 tag，或在 Actions 页面手动触发。
+# 产物：
+#   - hopdrop-cli-*      各平台命令行可执行文件（含压缩包）
+#   - HopDrop-macos.*    macOS 桌面端 .app（打包成 .zip / .dmg）
+#   - HopDrop-windows.*  Windows 桌面端 .exe 安装包（NSIS）
+#   - hopdrop.aar        Android 绑定库（供 App 集成/直出 APK）
+#   - HopDrop.xcframework iOS 绑定框架（供 App 集成/直出未签名 .ipa）
+# 所有产物既作为 workflow artifact 上传，tag 触发时也附加到 GitHub Release。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.22'
+  FYNE_VERSION: 'latest'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) CLI：交叉编译到 5 个平台，纯 Go、无需 CGO。
+  # ---------------------------------------------------------------------------
+  cli:
+    name: CLI (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build CLI
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          out="hopdrop"
+          [ "$GOOS" = "windows" ] && out="hopdrop.exe"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/$out" ./cmd/hopdrop
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip "hopdrop-cli-${GOOS}-${GOARCH}.zip" "$out"
+          else
+            tar czf "hopdrop-cli-${GOOS}-${GOARCH}.tar.gz" "$out"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hopdrop-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/hopdrop-cli-*
+
+  # ---------------------------------------------------------------------------
+  # 2) macOS 桌面端：Fyne 需要原生编译（CGO + OpenGL），在 macOS runner 上打 .app。
+  # ---------------------------------------------------------------------------
+  desktop-macos:
+    name: Desktop macOS (${{ matrix.goarch }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install fyne tool
+        run: go install fyne.io/tools/cmd/fyne@${{ env.FYNE_VERSION }}
+      - name: Package .app
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+        run: |
+          mkdir -p dist
+          "$(go env GOPATH)/bin/fyne" package \
+            --os darwin \
+            --name HopDrop \
+            --app-id com.hopdrop.desktop \
+            --release \
+            --src ./cmd/hopdrop-gui
+          # fyne 会在当前目录产出 HopDrop.app
+          zip -ry "dist/HopDrop-macos-${GOARCH}.zip" HopDrop.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HopDrop-macos-${{ matrix.goarch }}
+          path: dist/HopDrop-macos-*.zip
+
+  # ---------------------------------------------------------------------------
+  # 3) Windows 桌面端：在 Windows runner 上用 fyne 打成 .exe（含图标资源）。
+  # ---------------------------------------------------------------------------
+  desktop-windows:
+    name: Desktop Windows (amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install fyne tool
+        run: go install fyne.io/tools/cmd/fyne@${{ env.FYNE_VERSION }}
+      - name: Package .exe
+        shell: bash
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          mkdir -p dist
+          "$(go env GOPATH)/bin/fyne" package \
+            --os windows \
+            --name HopDrop \
+            --app-id com.hopdrop.desktop \
+            --release \
+            --src ./cmd/hopdrop-gui
+          # 产出 HopDrop.exe
+          7z a "dist/HopDrop-windows-amd64.zip" HopDrop.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HopDrop-windows-amd64
+          path: dist/HopDrop-windows-amd64.zip
+
+  # ---------------------------------------------------------------------------
+  # 4) Android：gomobile 产出 .aar，随后用 Gradle 把参考 App 打成 APK。
+  #    若你尚未提供完整的 Android Gradle 工程，可只保留 .aar 上传步骤。
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android (.aar + APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK
+        run: sdkmanager "ndk;26.1.10909125"
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: gomobile init
+        run: gomobile init
+      - name: Build .aar
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+        run: |
+          mkdir -p dist
+          gomobile bind -target=android -androidapi 21 -javapkg com.hopdrop \
+            -o dist/hopdrop.aar ./mobile
+      - name: Build APK (if Gradle project present)
+        run: |
+          if [ -f mobile/android/app/build.gradle ] || [ -f mobile/android/app/build.gradle.kts ]; then
+            mkdir -p mobile/android/app/libs
+            cp dist/hopdrop.aar mobile/android/app/libs/
+            (cd mobile/android && ./gradlew assembleRelease --no-daemon)
+            find mobile/android -name '*.apk' -exec cp {} dist/ \;
+          else
+            echo "No Android Gradle project found; shipping hopdrop.aar only."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HopDrop-android
+          path: |
+            dist/hopdrop.aar
+            dist/*.apk
+
+  # ---------------------------------------------------------------------------
+  # 5) iOS：gomobile 产出 .xcframework，随后（可选）用 xcodebuild 打未签名 .ipa。
+  #    真正上架需要签名证书/描述文件，这里默认只产出框架 + 未签名归档。
+  # ---------------------------------------------------------------------------
+  ios:
+    name: iOS (.xcframework + unsigned .ipa)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: gomobile init
+        run: gomobile init
+      - name: Build .xcframework
+        run: |
+          mkdir -p dist
+          gomobile bind -target=ios -o dist/HopDrop.xcframework ./mobile
+          # 打包框架为 zip 便于分发
+          (cd dist && zip -ry HopDrop-ios-xcframework.zip HopDrop.xcframework)
+      - name: Archive unsigned .ipa (if Xcode project present)
+        run: |
+          if [ -d mobile/ios/HopDrop.xcodeproj ] || [ -d mobile/ios/HopDrop.xcworkspace ]; then
+            cd mobile/ios
+            xcodebuild -scheme HopDrop -configuration Release \
+              -sdk iphoneos -archivePath build/HopDrop.xcarchive archive \
+              CODE_SIGNING_ALLOWED=NO
+            # 从 archive 里取出未签名 .app 打成 Payload/ 结构的 .ipa
+            APP=$(find build/HopDrop.xcarchive/Products/Applications -name '*.app' -maxdepth 1 | head -1)
+            if [ -n "$APP" ]; then
+              mkdir -p Payload && cp -R "$APP" Payload/
+              zip -ry "../../dist/HopDrop-ios-unsigned.ipa" Payload
+            fi
+          else
+            echo "No Xcode project found; shipping HopDrop.xcframework only."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HopDrop-ios
+          path: |
+            dist/HopDrop-ios-xcframework.zip
+            dist/HopDrop-ios-unsigned.ipa
+
+  # ---------------------------------------------------------------------------
+  # 6) 汇总：tag 触发时把全部产物挂到 GitHub Release。
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [cli, desktop-macos, desktop-windows, android, ios]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \
+            \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.aar' \
+               -o -name '*.apk' -o -name '*.ipa' \) \
+            -exec cp {} release/ \;
+          ls -la release
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

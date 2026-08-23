@@ -1,0 +1,23 @@
+# 构建产物
+/build/
+/dist/
+hopdrop
+hopdrop.exe
+hopdrop-gui
+hopdrop-gui.exe
+*.aar
+*.xcframework/
+*.ipa
+*.apk
+*.app/
+
+# gomobile / cgo 中间产物
+*.o
+*.a
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
