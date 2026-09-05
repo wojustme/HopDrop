@@ -6,29 +6,73 @@ import android.os.Bundle
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.hopdrop.mobile.Callback
 import com.hopdrop.mobile.Client
 import com.hopdrop.mobile.Mobile
 import com.hopdrop.mobile.Sink
 import org.json.JSONArray
 import org.json.JSONObject
+
+/**
+ * HopDrop 品牌配色（米白 + 深青），与桌面端 hopTheme 保持一致：
+ *   - 背景用温润米白，卡片用更亮的暖白拉出层次；
+ *   - 深青 teal 作强调色，深墨蓝灰作正文，冷暖平衡、对比清晰。
+ */
+private val CreamBackground = Color(0xFFF5F1E7)
+private val CreamSurface = Color(0xFFFCFAF4)
+private val CreamInput = Color(0xFFEEE8D9)
+private val AccentTeal = Color(0xFF0C8FA6)
+private val InkForeground = Color(0xFF242A33)
+private val MutedForeground = Color(0xFF8C8676)
+private val CreamSeparator = Color(0xFFE2DBC9)
+private val OnlineGreen = Color(0xFF12A46E)
+
+private val HopDropColorScheme = lightColorScheme(
+    primary = AccentTeal,
+    onPrimary = CreamSurface,
+    background = CreamBackground,
+    onBackground = InkForeground,
+    surface = CreamSurface,
+    onSurface = InkForeground,
+    surfaceVariant = CreamInput,
+    onSurfaceVariant = MutedForeground,
+    outline = CreamSeparator,
+)
 
 /**
  * MainActivity 是 HopDrop Android 参考 App 的唯一界面。
@@ -56,18 +100,18 @@ class MainActivity : ComponentActivity() {
             acquire()
         }
 
-        val peersState = mutableStateOf<List<String>>(emptyList())
+        val peersState = mutableStateOf<List<PeerItem>>(emptyList())
         val statusState = mutableStateOf("正在发现设备…")
 
         val callback = object : Callback {
             override fun onPeers(peersJSON: String) {
                 val arr = JSONArray(peersJSON)
-                val names = ArrayList<String>(arr.length())
+                val list = ArrayList<PeerItem>(arr.length())
                 for (i in 0 until arr.length()) {
                     val dev = arr.getJSONObject(i).getJSONObject("device")
-                    names.add("${dev.getString("name")} · ${dev.getString("platform")}")
+                    list.add(PeerItem(dev.getString("name"), dev.getString("platform")))
                 }
-                runOnUiThread { peersState.value = names }
+                runOnUiThread { peersState.value = list }
             }
 
             override fun onOffer(offerID: String, offerJSON: String) {
@@ -97,24 +141,14 @@ class MainActivity : ComponentActivity() {
         client.start(0)
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            MaterialTheme(colorScheme = HopDropColorScheme) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
                     val peers by peersState
                     val status by statusState
-                    Column(
-                        modifier = Modifier.fillMaxSize().padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text("HopDrop", style = MaterialTheme.typography.headlineSmall)
-                        Text(status)
-                        Text("在线设备（${peers.size}）:", style = MaterialTheme.typography.titleMedium)
-                        LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                            items(peers) { name -> Text("• $name", modifier = Modifier.padding(vertical = 4.dp)) }
-                        }
-                        Button(onClick = { /* 发送功能：选取文件后 client.sendToDevice(...) */ }) {
-                            Text("发送文件（示例占位）")
-                        }
-                    }
+                    HopDropScreen(peers = peers, status = status)
                 }
             }
         }
@@ -124,6 +158,131 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         if (::client.isInitialized) client.stop()
         multicastLock?.release()
+    }
+}
+
+/** PeerItem 是设备列表用的最小展示模型。 */
+private data class PeerItem(val name: String, val platform: String)
+
+/**
+ * HopDropScreen 是米白主题的主界面：品牌头 + 状态条 + 在线设备卡片列表 + 发送按钮。
+ */
+@androidx.compose.runtime.Composable
+private fun HopDropScreen(peers: List<PeerItem>, status: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        // —— 品牌头 ——
+        Column {
+            Text(
+                "HopDrop",
+                color = AccentTeal,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Text("局域网 · 极速互传", color = MutedForeground, fontSize = 13.sp)
+        }
+
+        // —— 状态条 ——
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = CreamSurface),
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .background(AccentTeal, CircleShape),
+                )
+                Text(status, color = InkForeground, fontSize = 15.sp)
+            }
+        }
+
+        // —— 在线设备 ——
+        Text(
+            "在线设备（${peers.size}）",
+            color = InkForeground,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            colors = CardDefaults.cardColors(containerColor = CreamSurface),
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            if (peers.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("正在扫描局域网设备…", color = MutedForeground, fontSize = 14.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text("确保设备处于同一 Wi-Fi 网络", color = MutedForeground, fontSize = 12.sp)
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize().padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(peers) { p -> PeerRow(p) }
+                }
+            }
+        }
+
+        // —— 发送按钮 ——
+        Button(
+            onClick = { /* 发送功能：选取文件后 client.sendToDevice(...) */ },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = AccentTeal,
+                contentColor = CreamSurface,
+            ),
+        ) {
+            Text("发送文件", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+/** PeerRow 是单台设备的卡片行：状态点 + 名称 + 平台标签。 */
+@androidx.compose.runtime.Composable
+private fun PeerRow(p: PeerItem) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(CreamInput, RoundedCornerShape(10.dp))
+            .border(1.dp, CreamSeparator, RoundedCornerShape(10.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(9.dp)
+                .background(OnlineGreen, CircleShape),
+        )
+        Text(
+            p.name,
+            color = InkForeground,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f),
+        )
+        Text(p.platform, color = MutedForeground, fontSize = 13.sp)
     }
 }
 

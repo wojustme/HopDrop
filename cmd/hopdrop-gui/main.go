@@ -19,9 +19,11 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/xurenhe/hopdrop/core/device"
@@ -45,7 +47,10 @@ type ui struct {
 	peers     []discovery.Peer // 当前在线设备（按名字排序）
 	selected  int              // 列表中选中的行，-1 表示未选
 	peerList  *widget.List
+	peerCount *widget.Label     // 头部「在线设备（N）」计数
+	emptyHint fyne.CanvasObject // 无设备时的占位提示（有设备时隐藏）
 	statusLbl *widget.Label
+	statusDot *canvas.Circle // 状态指示灯，随传输状态变色
 	progress  *widget.ProgressBar
 	dlDirLbl  *widget.Label
 
@@ -56,9 +61,11 @@ type ui struct {
 
 func main() {
 	a := app.NewWithID("com.hopdrop.desktop")
+	// 应用自定义主题：米白底 + 深青强调色，强制亮色以保证主视觉一致。
+	a.Settings().SetTheme(hopTheme{forceLight: true})
 	a.SetIcon(fyne.NewStaticResource("icon.png", appIcon))
 	w := a.NewWindow("HopDrop")
-	w.Resize(fyne.NewSize(560, 460))
+	w.Resize(fyne.NewSize(600, 520))
 
 	u := &ui{
 		win:         w,
@@ -90,46 +97,104 @@ func main() {
 
 func (u *ui) buildUI(name string) fyne.CanvasObject {
 	self := u.node.Self()
-	title := widget.NewLabel(fmt.Sprintf("本机: %s (%s)", name, self.Platform))
-	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	// —— 顶部品牌头（HUD 风格）：左侧应用标识，右侧本机身份胶囊 ——
+	header := u.buildHeader(name, self)
+
+	// —— 在线设备列表 ——
+	u.peerCount = widget.NewLabel("在线设备 (0)")
+	u.peerCount.TextStyle = fyne.TextStyle{Bold: true}
 
 	u.peerList = widget.NewList(
 		func() int { u.mu.Lock(); defer u.mu.Unlock(); return len(u.peers) },
-		func() fyne.CanvasObject { return widget.NewLabel("template") },
+		func() fyne.CanvasObject { return newPeerRow() },
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			u.mu.Lock()
 			defer u.mu.Unlock()
 			if i < len(u.peers) {
-				p := u.peers[i]
-				o.(*widget.Label).SetText(fmt.Sprintf("%s  ·  %s  @ %s", p.Device.Name, p.Device.Platform, p.SyncEndpoint()))
+				o.(*peerRow).set(u.peers[i])
 			}
 		},
 	)
 	u.peerList.OnSelected = func(id widget.ListItemID) { u.mu.Lock(); u.selected = id; u.mu.Unlock() }
 
-	sendFileBtn := widget.NewButton("发送文件…", func() { u.pickAndSend(false) })
-	sendDirBtn := widget.NewButton("发送文件夹…", func() { u.pickAndSend(true) })
-	refreshBtn := widget.NewButton("刷新设备", func() { u.refreshPeers() })
+	// 空状态提示叠加在列表上，未发现设备时给出扫描中的引导文案；有设备后隐藏，避免与设备行重叠。
+	u.emptyHint = container.NewCenter(container.NewVBox(
+		newCenteredIcon(theme.SearchIcon(), 44),
+		newMutedLabel("正在扫描局域网设备…", true),
+		newMutedLabel("确保设备处于同一 Wi-Fi 网络", false),
+	))
+	listStack := container.NewStack(u.emptyHint, u.peerList)
 
-	u.dlDirLbl = widget.NewLabel("下载目录: " + u.downloadDir)
-	chooseDlBtn := widget.NewButton("更改下载目录…", u.chooseDownloadDir)
+	deviceHeader := container.NewBorder(nil, nil, u.peerCount, nil)
+	deviceCard := newPanel("", container.NewBorder(
+		container.NewVBox(deviceHeader, widget.NewSeparator()), nil, nil, nil,
+		listStack,
+	))
 
-	u.statusLbl = widget.NewLabel("就绪。等待设备…")
+	// —— 操作区：发送 / 刷新 ——
+	sendFileBtn := widget.NewButtonWithIcon("发送文件", theme.MailSendIcon(), func() { u.pickAndSend(false) })
+	sendFileBtn.Importance = widget.HighImportance
+	sendDirBtn := widget.NewButtonWithIcon("发送文件夹", theme.FolderOpenIcon(), func() { u.pickAndSend(true) })
+	sendDirBtn.Importance = widget.HighImportance
+	refreshBtn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), func() { u.refreshPeers() })
+
+	buttons := container.NewGridWithColumns(3, sendFileBtn, sendDirBtn, refreshBtn)
+
+	// —— 状态条：指示灯 + 文案 + 进度 ——
+	u.statusDot = canvas.NewCircle(theme.Color(theme.ColorNamePlaceHolder))
+	u.statusDot.Resize(fyne.NewSize(10, 10))
+	dotWrap := container.NewGridWrap(fyne.NewSize(12, 12), u.statusDot)
+
+	u.statusLbl = widget.NewLabel("就绪 · 等待设备接入")
 	u.progress = widget.NewProgressBar()
 	u.progress.Hide()
 
-	buttons := container.NewHBox(sendFileBtn, sendDirBtn, refreshBtn)
-	bottom := container.NewVBox(
-		container.NewBorder(nil, nil, nil, chooseDlBtn, u.dlDirLbl),
-		u.statusLbl,
-		u.progress,
+	statusRow := container.NewBorder(nil, nil, container.NewCenter(dotWrap), nil, u.statusLbl)
+	statusCard := newPanel("", container.NewVBox(statusRow, u.progress))
+
+	// —— 下载目录 ——
+	u.dlDirLbl = newMutedLabel(u.downloadDir, false)
+	u.dlDirLbl.Truncation = fyne.TextTruncateEllipsis
+	chooseDlBtn := widget.NewButtonWithIcon("更改", theme.FolderIcon(), u.chooseDownloadDir)
+	chooseDlBtn.Importance = widget.LowImportance
+	dlRow := container.NewBorder(nil, nil,
+		container.NewHBox(newCenteredIcon(theme.DownloadIcon(), 18), widget.NewLabel("下载至")),
+		chooseDlBtn, u.dlDirLbl,
 	)
+	dlCard := newPanel("", dlRow)
+
+	bottom := container.NewVBox(buttons, statusCard, dlCard)
+
 	body := container.NewBorder(
-		container.NewVBox(title, widget.NewLabel("在线设备（点选后发送）:"), buttons),
+		container.NewVBox(header, widget.NewSeparator()),
 		bottom, nil, nil,
-		u.peerList,
+		deviceCard,
 	)
-	return body
+	return container.NewPadded(body)
+}
+
+// buildHeader 构造顶部品牌头：左侧图标 + 名称 + slogan，右侧本机身份胶囊。
+func (u *ui) buildHeader(name string, self protocol.DeviceInfo) fyne.CanvasObject {
+	logo := canvas.NewImageFromResource(fyne.NewStaticResource("icon.png", appIcon))
+	logo.FillMode = canvas.ImageFillContain
+	logo.SetMinSize(fyne.NewSize(40, 40))
+
+	brand := canvas.NewText("HopDrop", theme.Color(theme.ColorNamePrimary))
+	brand.TextSize = 26
+	brand.TextStyle = fyne.TextStyle{Bold: true}
+	slogan := newMutedLabel("局域网 · 极速互传", false)
+
+	left := container.NewHBox(logo, container.NewVBox(brand, slogan))
+
+	// 本机身份胶囊：设备名 + 平台。
+	selfIcon := newCenteredIcon(platformIcon(self.Platform), 18)
+	selfName := widget.NewLabelWithStyle(name, fyne.TextAlign(0), fyne.TextStyle{Bold: true})
+	selfPlat := newMutedLabel("本机 · "+string(self.Platform), false)
+	selfInfo := container.NewHBox(selfIcon, container.NewVBox(selfName, selfPlat))
+	right := newPanel("", selfInfo)
+
+	return container.NewBorder(nil, nil, left, right, nil)
 }
 
 // refreshPeers 从 node 拉取最新在线设备并刷新列表（在 UI 线程安全地更新）。
@@ -138,8 +203,21 @@ func (u *ui) refreshPeers() {
 	sort.Slice(peers, func(i, j int) bool { return peers[i].Device.Name < peers[j].Device.Name })
 	u.mu.Lock()
 	u.peers = peers
+	n := len(peers)
 	u.mu.Unlock()
-	fyne.Do(func() { u.peerList.Refresh() })
+	fyne.Do(func() {
+		u.peerList.Refresh()
+		if u.peerCount != nil {
+			u.peerCount.SetText(fmt.Sprintf("在线设备 (%d)", n))
+		}
+		if u.emptyHint != nil {
+			if n > 0 {
+				u.emptyHint.Hide()
+			} else {
+				u.emptyHint.Show()
+			}
+		}
+	})
 }
 
 // pickAndSend 弹出文件/文件夹选择器，选中后向当前选中的设备发送。
@@ -177,7 +255,7 @@ func (u *ui) pickAndSend(folder bool) {
 
 func (u *ui) startSend(target discovery.Peer, paths []string) {
 	fyne.Do(func() {
-		u.statusLbl.SetText(fmt.Sprintf("正在发送到 %s …", target.Device.Name))
+		u.setStatus(fmt.Sprintf("正在发送到 %s …", target.Device.Name), statusBusy)
 		u.progress.SetValue(0)
 		u.progress.Show()
 	})
@@ -187,7 +265,7 @@ func (u *ui) startSend(target discovery.Peer, paths []string) {
 			if err != nil {
 				u.progress.Hide()
 				dialog.ShowError(err, u.win)
-				u.statusLbl.SetText("发送失败。")
+				u.setStatus("发送失败", statusError)
 			}
 		})
 	}()
@@ -219,8 +297,8 @@ func (u *ui) onProgress(p syncpkg.Progress) {
 			if p.Direction == "send" {
 				verb = "发送"
 			}
-			u.statusLbl.SetText(fmt.Sprintf("%s %d/%d  %s  (%s/%s)",
-				verb, p.Files, p.TotalFiles, p.CurrentName, humanBytes(p.Bytes), humanBytes(p.TotalBytes)))
+			u.setStatus(fmt.Sprintf("%s %d/%d · %s (%s/%s)",
+				verb, p.Files, p.TotalFiles, p.CurrentName, humanBytes(p.Bytes), humanBytes(p.TotalBytes)), statusBusy)
 		case "done":
 			u.progress.SetValue(1)
 			u.progress.Hide()
@@ -228,13 +306,13 @@ func (u *ui) onProgress(p syncpkg.Progress) {
 			if p.Direction == "send" {
 				verb = "发送"
 			}
-			u.statusLbl.SetText(fmt.Sprintf("%s完成: %d 个文件, 共 %s", verb, p.Files, humanBytes(p.Bytes)))
+			u.setStatus(fmt.Sprintf("%s完成 · %d 个文件 · 共 %s", verb, p.Files, humanBytes(p.Bytes)), statusOK)
 		case "rejected":
 			u.progress.Hide()
-			u.statusLbl.SetText("对方拒绝了本次传输。")
+			u.setStatus("对方拒绝了本次传输", statusWarn)
 		case "error":
 			u.progress.Hide()
-			u.statusLbl.SetText("出错: " + p.Err)
+			u.setStatus("出错: "+p.Err, statusError)
 		}
 	})
 }
@@ -261,7 +339,7 @@ func (u *ui) chooseDownloadDir() {
 		u.node.OnDecision(u.onDecision)
 		u.node.OnProgress(u.onProgress)
 		_ = u.node.Start(0)
-		u.dlDirLbl.SetText("下载目录: " + newDir)
+		u.dlDirLbl.SetText(newDir)
 	}, u.win)
 }
 
