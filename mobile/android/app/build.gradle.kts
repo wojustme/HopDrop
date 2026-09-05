@@ -9,7 +9,8 @@ android {
 
     defaultConfig {
         applicationId = "com.hopdrop.app"
-        minSdk = 21
+        // 接收落地用 MediaStore.Downloads（Android 10/API 29 起免运行时存储权限）。
+        minSdk = 29
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"

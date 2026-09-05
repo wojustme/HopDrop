@@ -60,13 +60,19 @@ type Sink interface {
 }
 
 // Source 是宿主实现的发送取源接口，用于从相册/沙盒读取要发送的文件。
+//
+// 说明（gomobile 约束）：不能沿用 io.Reader 的 Read(p []byte) 语义——gomobile 把
+// []byte 参数从 Go 拷贝给 Java/Swift 后，宿主对该数组的写入不会回传给 Go，因此
+// “宿主往传入缓冲区里填字节”这种写法拿不到数据。这里改为让宿主每次“返回”下一段
+// 字节（返回值方向的 []byte 会被拷回 Go），返回空切片表示读到结尾（EOF）。
 type Source interface {
 	// ListJSON 返回本次要发送文件的 []FileMetaJSON 的 JSON 编码。
 	ListJSON() (string, error)
 	// OpenRead 打开给定文件 ID 的一个读句柄。
 	OpenRead(fileID string) (handle string, err error)
-	// Read 从句柄读取最多 len(p) 字节到 p，返回读到的字节数；读到结尾返回 (0, nil)。
-	Read(handle string, p []byte) (n int, err error)
+	// ReadChunk 返回句柄的下一段字节；返回空切片（长度 0）表示已到文件结尾。
+	// 分段大小由宿主自行决定（建议 64KB~256KB）。
+	ReadChunk(handle string) ([]byte, error)
 	// CloseRead 关闭读句柄。
 	CloseRead(handle string) error
 }
@@ -294,20 +300,32 @@ func (a *sourceAdapter) Open(fileID string) (io.ReadCloser, error) {
 	return &sourceReader{src: a.src, handle: handle}, nil
 }
 
-// sourceReader 把宿主的 Read(handle, p) 适配成 io.ReadCloser。
+// sourceReader 把宿主的 ReadChunk(handle) 适配成 io.ReadCloser。
+// 宿主一次可能返回任意长度的分段，这里用 pending 暂存尚未被 Read 消费完的部分。
 type sourceReader struct {
-	src    Source
-	handle string
+	src     Source
+	handle  string
+	pending []byte // 上一次 ReadChunk 读到但尚未交给 Read 的剩余字节
+	eof     bool
 }
 
 func (r *sourceReader) Read(p []byte) (int, error) {
-	n, err := r.src.Read(r.handle, p)
-	if err != nil {
-		return n, err
+	if len(r.pending) == 0 {
+		if r.eof {
+			return 0, io.EOF
+		}
+		chunk, err := r.src.ReadChunk(r.handle)
+		if err != nil {
+			return 0, err
+		}
+		if len(chunk) == 0 {
+			r.eof = true
+			return 0, io.EOF
+		}
+		r.pending = chunk
 	}
-	if n == 0 {
-		return 0, io.EOF
-	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
 	return n, nil
 }
 

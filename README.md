@@ -89,8 +89,14 @@ scripts/build-ios.sh        # → build/ios/HopDrop.xcframework
 
 - Android：把 `hopdrop.aar` 作模块依赖，参考 `mobile/android/`。需声明
   `CHANGE_WIFI_MULTICAST_STATE` 并获取 `MulticastLock`（Controller 已封装）。
+  参考 App 支持双向传输：点选设备后用系统文件选择器（SAF）挑文件推送，收到
+  传输时弹窗确认；接收落地走 `MediaStore.Downloads`，故 `minSdk = 29`（Android 10+），
+  无需运行时存储权限。
 - iOS：把 `HopDrop.xcframework` 拖入 Xcode，参考 `mobile/ios/`。需在 Info.plist
-  声明 `NSLocalNetworkUsageDescription` 与 `NSBonjourServices`。
+  声明 `NSLocalNetworkUsageDescription` 与 `NSBonjourServices`。参考 App 同样支持
+  双向传输：点选设备后用 `.fileImporter` 挑文件（`FileSource` 流式读出）推送，收到
+  传输时弹窗确认；接收落地到 App `Documents/HopDrop`（`DocumentSink`，按 `rel_path`
+  重建子目录并做路径穿越防护）。
 
 ## 发布安装包
 
