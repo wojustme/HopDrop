@@ -160,10 +160,10 @@ class MainActivity : ComponentActivity() {
                 val text = when (phase) {
                     "transfer" -> "$verb ${p.getInt("files")}/${p.getInt("total_files")} · " +
                         p.optString("current_name")
-                    "done" -> "$verb完成 · ${p.getInt("files")} 个文件"
+                    "done" -> "${verb}完成 · ${p.getInt("files")} 个文件"
                     "rejected" -> "对方拒绝了本次传输"
                     "error" -> "出错: ${p.optString("err")}"
-                    else -> "$verb中…"
+                    else -> "${verb}中…"
                 }
                 runOnUiThread { statusState.value = text }
             }
