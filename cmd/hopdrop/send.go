@@ -47,6 +47,8 @@ func cmdSend(args []string) {
 	}
 	// 发送端也需要一个 sink 占位（不会被用到，因为我们只主动发送）。
 	node := syncpkg.NewNode(self.Name, self.Platform, self.ID, nil)
+	// 与接收端一致，用标准 mDNS 发现。
+	node.SetDiscovery(syncpkg.DiscoveryMDNS)
 	node.OnProgress(func(p syncpkg.Progress) {
 		if p.Direction != "send" {
 			return

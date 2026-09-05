@@ -45,6 +45,8 @@ func cmdRecv(args []string) {
 	}
 
 	node := syncpkg.NewNode(*name, currentPlatform(), deviceID, sink)
+	// 桌面/CLI 用标准 mDNS 发现，能与 iOS Bonjour / Android NsdManager 互通。
+	node.SetDiscovery(syncpkg.DiscoveryMDNS)
 
 	// 决策回调：--yes 直接全收；否则在终端里询问。
 	var askMu sync.Mutex

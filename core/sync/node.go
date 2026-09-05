@@ -16,15 +16,21 @@ import (
 //
 // 启动后 Node 会：
 //   - 监听一个 TCP 端口，接受入站传输（收到 Offer 时通过 DecisionFunc 决策）；
-//   - 通过组播发现局域网内的其他设备（供上层选择发送目标）。
+//   - 通过可插拔的发现后端发现局域网内的其他设备（供上层选择发送目标）。
+//
+// 发现后端由 DiscoveryKind 选择：
+//   - DiscoveryMulticast：自研 UDP 组播（默认，单元测试与老路径）；
+//   - DiscoveryMDNS：标准 mDNS/DNS-SD（桌面端，能与 Bonjour/NsdManager 互通）；
+//   - DiscoveryManual：不自行发现，peer 由外部（移动端原生 Bonjour）喂入。
 //
 // 发送由上层主动触发：调用 SendPaths / SendSource 把文件推送给某个 peer。
 type Node struct {
-	self protocol.DeviceInfo
-	sink filestore.Sink
+	self     protocol.DeviceInfo
+	sink     filestore.Sink
+	discKind DiscoveryKind
 
 	engine *Engine
-	disc   *discovery.Discoverer
+	disc   discovery.Backend
 	ln     net.Listener
 
 	onProgress ProgressFunc
@@ -36,8 +42,21 @@ type Node struct {
 	wg     sync.WaitGroup
 }
 
+// DiscoveryKind 选择 Node 使用的发现后端。
+type DiscoveryKind int
+
+const (
+	// DiscoveryMulticast 使用自研 UDP 组播（默认）。
+	DiscoveryMulticast DiscoveryKind = iota
+	// DiscoveryMDNS 使用标准 mDNS/DNS-SD。
+	DiscoveryMDNS
+	// DiscoveryManual 不自行发现，peer 由外部喂入（AddPeer/RemovePeer）。
+	DiscoveryManual
+)
+
 // NewNode 构造一个 Node。name/platform 描述本设备；sink 为接收落地目标
-// （只发不收的场景可传 nil，但那样将拒绝入站文件）。
+// （只发不收的场景可传 nil，但那样将拒绝入站文件）。默认使用组播发现，
+// 需要其它后端时在 Start 前调用 SetDiscovery。
 func NewNode(name string, platform protocol.Platform, deviceID string, sink filestore.Sink) *Node {
 	return &Node{
 		self: protocol.DeviceInfo{
@@ -45,9 +64,13 @@ func NewNode(name string, platform protocol.Platform, deviceID string, sink file
 			Name:     name,
 			Platform: platform,
 		},
-		sink: sink,
+		sink:     sink,
+		discKind: DiscoveryMulticast,
 	}
 }
+
+// SetDiscovery 选择发现后端，必须在 Start 之前调用。
+func (n *Node) SetDiscovery(kind DiscoveryKind) { n.discKind = kind }
 
 // OnProgress 注册传输进度回调（可选）。
 func (n *Node) OnProgress(fn ProgressFunc) { n.onProgress = fn }
@@ -72,7 +95,7 @@ func (n *Node) Start(port int) error {
 	n.self.SyncPort = ln.Addr().(*net.TCPAddr).Port
 
 	n.engine = NewEngine(n.self, n.sink, n.decide)
-	n.disc = discovery.New(n.self)
+	n.disc = n.newBackend()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n.mu.Lock()
@@ -122,6 +145,27 @@ func (n *Node) Peers() []discovery.Peer {
 		return nil
 	}
 	return n.disc.Peers()
+}
+
+// newBackend 依据 discKind 构造对应的发现后端。
+func (n *Node) newBackend() discovery.Backend {
+	switch n.discKind {
+	case DiscoveryMDNS:
+		return discovery.NewMDNS(n.self)
+	case DiscoveryManual:
+		return discovery.NewManual(n.self.ID)
+	default:
+		return discovery.New(n.self)
+	}
+}
+
+// ManualDiscovery 返回底层的手动发现后端（仅当 DiscoveryManual 时非 nil），
+// 供移动端把系统原生 Bonjour 发现到的 peer 喂进来。
+func (n *Node) ManualDiscovery() *discovery.ManualBackend {
+	if mb, ok := n.disc.(*discovery.ManualBackend); ok {
+		return mb
+	}
+	return nil
 }
 
 // SendSource 把一个 filestore.Source 中的文件发送给指定 peer。

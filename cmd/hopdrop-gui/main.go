@@ -12,6 +12,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -81,18 +82,33 @@ func main() {
 	name := deviceName()
 
 	u.node = syncpkg.NewNode(name, currentPlatform(), deviceID, sink)
+	// 桌面端用标准 mDNS 发现，能与 iOS Bonjour / Android NsdManager 互通。
+	u.node.SetDiscovery(syncpkg.DiscoveryMDNS)
 	u.node.OnPeer(func(ev discovery.PeerEvent) { u.refreshPeers() })
 	u.node.OnDecision(u.onDecision)
 	u.node.OnProgress(u.onProgress)
 
 	w.SetContent(u.buildUI(name))
 
-	if err := u.node.Start(0); err != nil {
+	// 固定监听端口，让手机「扫一次码」后即便桌面重启（端口不变）仍可直连；
+	// 端口被占用时回退到系统随机分配，避免启动失败。
+	if err := u.startNode(); err != nil {
 		dialog.ShowError(fmt.Errorf("启动失败: %w", err), w)
 	}
 	w.SetOnClosed(func() { u.node.Stop() })
 
 	w.ShowAndRun()
+}
+
+// defaultSyncPort 是桌面端优先监听的固定端口，配合手动配对二维码实现「扫一次长期可用」。
+const defaultSyncPort = 47772
+
+// startNode 先尝试固定端口，占用时回退随机端口。
+func (u *ui) startNode() error {
+	if err := u.node.Start(defaultSyncPort); err != nil {
+		return u.node.Start(0)
+	}
+	return nil
 }
 
 func (u *ui) buildUI(name string) fyne.CanvasObject {
@@ -132,14 +148,15 @@ func (u *ui) buildUI(name string) fyne.CanvasObject {
 		listStack,
 	))
 
-	// —— 操作区：发送 / 刷新 ——
+	// —— 操作区：发送 / 手动配对 / 刷新 ——
 	sendFileBtn := widget.NewButtonWithIcon("发送文件", theme.MailSendIcon(), func() { u.pickAndSend(false) })
 	sendFileBtn.Importance = widget.HighImportance
 	sendDirBtn := widget.NewButtonWithIcon("发送文件夹", theme.FolderOpenIcon(), func() { u.pickAndSend(true) })
 	sendDirBtn.Importance = widget.HighImportance
+	pairBtn := widget.NewButtonWithIcon("手动配对", theme.ContentAddIcon(), func() { u.showPairing() })
 	refreshBtn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), func() { u.refreshPeers() })
 
-	buttons := container.NewGridWithColumns(3, sendFileBtn, sendDirBtn, refreshBtn)
+	buttons := container.NewGridWithColumns(4, sendFileBtn, sendDirBtn, pairBtn, refreshBtn)
 
 	// —— 状态条：指示灯 + 文案 + 进度 ——
 	u.statusDot = canvas.NewCircle(theme.Color(theme.ColorNamePlaceHolder))
@@ -187,14 +204,34 @@ func (u *ui) buildHeader(name string, self protocol.DeviceInfo) fyne.CanvasObjec
 
 	left := container.NewHBox(logo, container.NewVBox(brand, slogan))
 
-	// 本机身份胶囊：设备名 + 平台。
+	// 本机身份胶囊：设备名 + 平台 + 可直连端点（供手动配对展示）。
 	selfIcon := newCenteredIcon(platformIcon(self.Platform), 18)
 	selfName := widget.NewLabelWithStyle(name, fyne.TextAlign(0), fyne.TextStyle{Bold: true})
-	selfPlat := newMutedLabel("本机 · "+string(self.Platform), false)
+	selfPlat := newMutedLabel("本机 · "+string(self.Platform)+" · "+u.localEndpoint(), false)
 	selfInfo := container.NewHBox(selfIcon, container.NewVBox(selfName, selfPlat))
 	right := newPanel("", selfInfo)
 
 	return container.NewBorder(nil, nil, left, right, nil)
+}
+
+// localEndpoint 返回本机首个可直连的 "host:port"（供手动配对展示）；无地址时返回占位。
+func (u *ui) localEndpoint() string {
+	ips := discovery.LocalIPv4s()
+	if len(ips) == 0 {
+		return "无局域网地址"
+	}
+	return fmt.Sprintf("%s:%d", ips[0], u.node.Self().SyncPort)
+}
+
+// pairingURI 返回本机配对串，供二维码编码。带上 id 便于扫码方把本机登记为在线设备。
+func (u *ui) pairingURI() string {
+	ips := discovery.LocalIPv4s()
+	if len(ips) == 0 {
+		return ""
+	}
+	self := u.node.Self()
+	return fmt.Sprintf("hopdrop://%s:%d?id=%s&name=%s&platform=%s",
+		ips[0], self.SyncPort, url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform)
 }
 
 // refreshPeers 从 node 拉取最新在线设备并刷新列表（在 UI 线程安全地更新）。
@@ -335,10 +372,11 @@ func (u *ui) chooseDownloadDir() {
 		u.node.Stop()
 		self := u.node.Self()
 		u.node = syncpkg.NewNode(self.Name, self.Platform, self.ID, sink)
+		u.node.SetDiscovery(syncpkg.DiscoveryMDNS)
 		u.node.OnPeer(func(ev discovery.PeerEvent) { u.refreshPeers() })
 		u.node.OnDecision(u.onDecision)
 		u.node.OnProgress(u.onProgress)
-		_ = u.node.Start(0)
+		_ = u.startNode()
 		u.dlDirLbl.SetText(newDir)
 	}, u.win)
 }

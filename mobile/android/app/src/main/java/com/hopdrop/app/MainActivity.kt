@@ -1,6 +1,11 @@
 package com.hopdrop.app
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -9,7 +14,11 @@ import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +31,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -31,6 +41,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -38,10 +50,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -93,7 +107,10 @@ private val HopDropColorScheme = lightColorScheme(
 class MainActivity : ComponentActivity() {
 
     private lateinit var client: Client
-    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+    /** 下拉通知栏的传输进度通知管理器。 */
+    private lateinit var transferNotifier: TransferNotifier
+    /** 原生 NsdManager 发现（系统 mDNS），把发现到的 peer 喂给 Go 侧。 */
+    private var nsd: HopDropNsd? = null
 
     // —— Compose 可观察状态 ——
     private val peersState = mutableStateOf<List<PeerItem>>(emptyList())
@@ -101,22 +118,52 @@ class MainActivity : ComponentActivity() {
     private val selectedIdState = mutableStateOf<String?>(null)
     /** 待用户确认的入站传输；非空时展示确认弹窗。 */
     private val pendingOfferState = mutableStateOf<PendingOffer?>(null)
+    /** 非空时展示全屏传输遮罩（发送/接收进行中及短暂终态）。 */
+    private val transferState = mutableStateOf<TransferInfo?>(null)
+    /** 本机设备名/平台，用于界面展示。 */
+    private val selfNameState = mutableStateOf("Android")
+    private val selfPlatformState = mutableStateOf("android")
+    /** 本机配对串（hopdrop://host:port?...）；空表示无可用局域网地址。 */
+    private val pairingUriState = mutableStateOf("")
+    /** 控制配对面板呈现。 */
+    private val showPairingState = mutableStateOf(false)
+    /** 扫码得到对端端点后暂存，待用户选文件后直连发送。 */
+    private var pendingEndpoint: String? = null
+    /** 终态遮罩的延时收起句柄，便于被下一条进度取消。 */
+    private var dismissRunnable: Runnable? = null
 
     /** 系统文件选择器：可多选，返回若干 content:// URI。 */
     private val pickFiles = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> if (!uris.isNullOrEmpty()) startSend(uris) }
 
+    /** 扫码后拉起的文件选择器：选完直连发送到 pendingEndpoint。 */
+    private val pickFilesForEndpoint = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> if (!uris.isNullOrEmpty()) startSendEndpoint(uris) }
+
+    /** 扫码：调用 zxing-embedded 的扫码 Activity，返回扫到的文本。 */
+    private val scanQr = registerForActivityResult(com.journeyapps.barcodescanner.ScanContract()) { result ->
+        val text = result.contents ?: return@registerForActivityResult
+        val ep = parsePairingEndpoint(text) ?: run {
+            statusState.value = "无法识别的二维码"
+            return@registerForActivityResult
+        }
+        pendingEndpoint = ep
+        // 选文件后直连发送。
+        pickFilesForEndpoint.launch(arrayOf("*/*"))
+    }
+
+    /** Android 13+ 通知权限请求（拒绝也不影响传输，只是没有通知栏进度）。 */
+    private val requestNotifPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* 用户选择结果无需特殊处理 */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 组播必须持有 MulticastLock，否则收不到设备发现广播。
-        val wifi = applicationContext
-            .getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-        multicastLock = wifi.createMulticastLock("hopdrop").apply {
-            setReferenceCounted(true)
-            acquire()
-        }
+        transferNotifier = TransferNotifier(this)
+        ensureNotificationPermission()
 
         val callback = object : Callback {
             override fun onPeers(peersJSON: String) {
@@ -154,18 +201,23 @@ class MainActivity : ComponentActivity() {
 
             override fun onProgress(progressJSON: String) {
                 val p = JSONObject(progressJSON)
-                val phase = p.getString("phase")
-                val dir = p.optString("direction")
-                val verb = if (dir == "send") "发送" else "接收"
-                val text = when (phase) {
-                    "transfer" -> "$verb ${p.getInt("files")}/${p.getInt("total_files")} · " +
-                        p.optString("current_name")
-                    "done" -> "${verb}完成 · ${p.getInt("files")} 个文件"
-                    "rejected" -> "对方拒绝了本次传输"
-                    "error" -> "出错: ${p.optString("err")}"
-                    else -> "${verb}中…"
+                val info = TransferInfo(
+                    direction = p.optString("direction"),
+                    phase = p.getString("phase"),
+                    peerName = p.optString("peer_name"),
+                    currentName = p.optString("current_name"),
+                    files = p.optInt("files"),
+                    totalFiles = p.optInt("total_files"),
+                    bytes = p.optLong("bytes"),
+                    totalBytes = p.optLong("total_bytes"),
+                    err = p.optString("err"),
+                )
+                runOnUiThread {
+                    statusState.value = info.statusText()
+                    // 同步更新全屏遮罩与下拉通知栏进度。
+                    updateTransferOverlay(info)
+                    transferNotifier.update(info)
                 }
-                runOnUiThread { statusState.value = text }
             }
         }
 
@@ -177,6 +229,10 @@ class MainActivity : ComponentActivity() {
             callback,
         )
         client.start(0)
+        selfNameState.value = client.selfName()
+        selfPlatformState.value = client.selfPlatform()
+        pairingUriState.value = client.pairingURI()
+        startNsd()
 
         setContent {
             MaterialTheme(colorScheme = HopDropColorScheme) {
@@ -188,13 +244,20 @@ class MainActivity : ComponentActivity() {
                     val status by statusState
                     val selectedId by selectedIdState
                     val pending by pendingOfferState
+                    val transfer by transferState
+                    val selfName by selfNameState
+                    val selfPlatform by selfPlatformState
+                    val showPairing by showPairingState
 
                     HopDropScreen(
                         peers = peers,
                         status = status,
                         selectedId = selectedId,
+                        selfName = selfName,
+                        selfPlatform = selfPlatform,
                         onSelect = { selectedIdState.value = it },
                         onSend = ::onSendClicked,
+                        onPair = { showPairingState.value = true },
                     )
 
                     pending?.let { offer ->
@@ -204,6 +267,21 @@ class MainActivity : ComponentActivity() {
                             onReject = { respondOffer(offer.id, false) },
                         )
                     }
+
+                    if (showPairing) {
+                        PairingDialog(
+                            uri = pairingUriState.value,
+                            selfName = selfName,
+                            onScan = {
+                                showPairingState.value = false
+                                launchScanner()
+                            },
+                            onDismiss = { showPairingState.value = false },
+                        )
+                    }
+
+                    // 全屏传输遮罩：传输/接收进行中及短暂终态时盖住整个界面。
+                    transfer?.let { TransferOverlay(info = it) }
                 }
             }
         }
@@ -211,11 +289,85 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        nsd?.stop()
+        nsd = null
         if (::client.isInitialized) client.stop()
-        multicastLock?.release()
+        transferNotifier.cancel()
     }
 
-    /** 点“发送文件”：先确认已选设备，再拉起系统文件选择器。 */
+    /** startNsd 启动系统 NsdManager 发现，把结果喂进 Go 的 Client。 */
+    private fun startNsd() {
+        // 从 selfJSON 里取稳定设备 ID（与对端看到的一致、且用于过滤自己）。
+        val self = JSONObject(client.selfJSON())
+        val id = self.optString("id")
+        val n = HopDropNsd(
+            context = applicationContext,
+            selfId = id,
+            selfName = client.selfName(),
+            selfPlatform = client.selfPlatform(),
+            port = client.selfSyncPort().toInt(),
+        )
+        n.onResolved = { pid, name, platform, addr, port ->
+            client.addDiscoveredPeer(pid, name, platform, addr, port.toLong())
+        }
+        n.onRemoved = { pid -> client.removeDiscoveredPeer(pid) }
+        n.start()
+        nsd = n
+    }
+
+    /** 拉起 zxing 扫码界面。 */
+    private fun launchScanner() {
+        val opts = com.journeyapps.barcodescanner.ScanOptions().apply {
+            setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+            setPrompt("对准对方的 HopDrop 二维码")
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+        }
+        scanQr.launch(opts)
+    }
+
+    /** 扫码得到文件后，直连发送到 pendingEndpoint。 */
+    private fun startSendEndpoint(uris: List<Uri>) {
+        val endpoint = pendingEndpoint ?: return
+        pendingEndpoint = null
+        statusState.value = "正在直连发送 ${uris.size} 个文件…"
+        Thread {
+            try {
+                val source = ContentResolverSource(contentResolver, uris)
+                client.sendToEndpoint(endpoint, source)
+            } catch (e: Exception) {
+                runOnUiThread { statusState.value = "发送失败: ${e.message}" }
+            }
+        }.start()
+    }
+
+    /** Android 13+ 首次进入时请求通知权限（用于下拉通知栏进度）。 */
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) requestNotifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    /**
+     * updateTransferOverlay 维护全屏遮罩显隐：
+     *   - handshake / offer / transfer：立即显示并保持；
+     *   - done / rejected / error：展示终态，短暂停留后自动收起。
+     */
+    private fun updateTransferOverlay(info: TransferInfo) {
+        dismissRunnable?.let { window.decorView.removeCallbacks(it) }
+        transferState.value = info
+        if (info.isTerminal()) {
+            val delay = if (info.phase == "done") 1400L else 1800L
+            val r = Runnable { transferState.value = null }
+            dismissRunnable = r
+            window.decorView.postDelayed(r, delay)
+        }
+    }
+
+    /** 点"发送文件"：先确认已选设备，再拉起系统文件选择器。 */
     private fun onSendClicked() {
         if (selectedIdState.value == null) {
             statusState.value = "请先在上方列表选择一台设备"
@@ -259,15 +411,18 @@ private data class PendingOffer(
 )
 
 /**
- * HopDropScreen 是米白主题的主界面：品牌头 + 状态条 + 在线设备卡片列表 + 发送按钮。
+ * HopDropScreen 是米白主题的主界面：品牌头 + 本机设备名 + 状态条 + 在线设备卡片列表 + 操作按钮。
  */
 @androidx.compose.runtime.Composable
 private fun HopDropScreen(
     peers: List<PeerItem>,
     status: String,
     selectedId: String?,
+    selfName: String,
+    selfPlatform: String,
     onSelect: (String) -> Unit,
     onSend: () -> Unit,
+    onPair: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -284,6 +439,25 @@ private fun HopDropScreen(
                 fontWeight = FontWeight.Bold,
             )
             Text("局域网 · 极速互传", color = MutedForeground, fontSize = 13.sp)
+        }
+
+        // —— 本机设备名卡片 ——
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = CreamSurface),
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            Row(
+                modifier = Modifier.padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(selfName, color = InkForeground, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    Text("本机 · $selfPlatform", color = MutedForeground, fontSize = 12.sp)
+                }
+                TextButton(onClick = onPair) { Text("二维码") }
+            }
         }
 
         // —— 状态条 ——
@@ -343,19 +517,35 @@ private fun HopDropScreen(
             }
         }
 
-        // —— 发送按钮 ——
-        Button(
-            onClick = onSend,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp),
-            shape = RoundedCornerShape(12.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = AccentTeal,
-                contentColor = CreamSurface,
-            ),
+        // —— 操作按钮：发送文件 + 扫码 ——
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("发送文件", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Button(
+                onClick = onSend,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(52.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = AccentTeal,
+                    contentColor = CreamSurface,
+                ),
+            ) {
+                Text("发送文件", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            }
+            Button(
+                onClick = onPair,
+                modifier = Modifier.height(52.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CreamInput,
+                    contentColor = AccentTeal,
+                ),
+            ) {
+                Text("扫码", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            }
         }
     }
 }
@@ -414,6 +604,92 @@ private fun OfferDialog(offer: PendingOffer, onAccept: () -> Unit, onReject: () 
     )
 }
 
+/**
+ * PairingDialog 是手动配对面板：展示本机二维码（供对方扫）+ 一个「扫码发送给对方」按钮。
+ *
+ * 组播被限制时（如对端是未授权 iOS），扫码可直连 TCP 传输，绕过设备发现。
+ */
+@androidx.compose.runtime.Composable
+private fun PairingDialog(
+    uri: String,
+    selfName: String,
+    onScan: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val qr = remember(uri) { if (uri.isNotEmpty()) generateQr(uri, 640) else null }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("手动配对") },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("让对方扫这个码", color = InkForeground, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                if (qr != null) {
+                    Image(
+                        bitmap = qr.asImageBitmap(),
+                        contentDescription = "配对二维码",
+                        modifier = Modifier
+                            .size(220.dp)
+                            .background(Color.White, RoundedCornerShape(12.dp))
+                            .padding(10.dp),
+                    )
+                    Text(selfName, color = InkForeground, fontSize = 14.sp)
+                    val ep = parsePairingEndpoint(uri)
+                    if (ep != null) {
+                        Text(ep, color = MutedForeground, fontSize = 12.sp)
+                    }
+                } else {
+                    Text(
+                        "暂无可用局域网地址\n请确认已连接 Wi-Fi",
+                        color = MutedForeground,
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onScan) { Text("扫码发送给对方") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
+}
+
+/**
+ * parsePairingEndpoint 从配对串解析出可直连的 "host:port"。
+ * 支持 hopdrop://host:port?... 与裸 host:port 两种输入。
+ */
+private fun parsePairingEndpoint(raw: String): String? {
+    val s = raw.trim()
+    if (s.isEmpty()) return null
+    if (!s.startsWith("hopdrop://")) {
+        return if (s.contains(":")) s else null
+    }
+    var rest = s.removePrefix("hopdrop://")
+    val q = rest.indexOf('?')
+    if (q >= 0) rest = rest.substring(0, q)
+    return rest.ifEmpty { null }
+}
+
+/** generateQr 用 zxing 生成一张 size×size 的黑白二维码位图。 */
+private fun generateQr(content: String, size: Int): android.graphics.Bitmap? {
+    return try {
+        val hints = mapOf(com.google.zxing.EncodeHintType.MARGIN to 1)
+        val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+            content, com.google.zxing.BarcodeFormat.QR_CODE, size, size, hints,
+        )
+        val bmp = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+        for (x in 0 until size) {
+            for (y in 0 until size) {
+                bmp.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
+        }
+        bmp
+    } catch (e: Exception) {
+        null
+    }
+}
+
 /** humanBytes 把字节数格式化为可读字符串。 */
 private fun humanBytes(n: Long): String {
     if (n < 1024) return "$n B"
@@ -425,6 +701,231 @@ private fun humanBytes(n: Long): String {
         i++
     }
     return String.format("%.1f %s", v, units[i])
+}
+
+/**
+ * TransferInfo 是一次传输进度的展示模型，字段与 mobile/dto.go 的 ProgressJSON 对齐，
+ * 同时驱动全屏遮罩与下拉通知栏进度。
+ */
+private data class TransferInfo(
+    val direction: String,
+    val phase: String,
+    val peerName: String,
+    val currentName: String,
+    val files: Int,
+    val totalFiles: Int,
+    val bytes: Long,
+    val totalBytes: Long,
+    val err: String,
+) {
+    val verb: String get() = if (direction == "send") "发送" else "接收"
+
+    /** 进度（0..1）。总字节为 0 时回退到文件数比例。 */
+    fun fraction(): Float = when {
+        totalBytes > 0 -> (bytes.toFloat() / totalBytes).coerceIn(0f, 1f)
+        totalFiles > 0 -> (files.toFloat() / totalFiles).coerceIn(0f, 1f)
+        else -> 0f
+    }
+
+    fun isTerminal(): Boolean = phase == "done" || phase == "rejected" || phase == "error"
+
+    fun title(): String = when (phase) {
+        "done" -> "${verb}完成"
+        "rejected" -> "对方已拒绝"
+        "error" -> "传输出错"
+        "transfer" -> "正在$verb"
+        else -> "${verb}准备中…"
+    }
+
+    fun subtitle(): String = when (phase) {
+        "done" -> "共 $files 个文件 · ${humanBytes(bytes)}"
+        "rejected" -> peerName
+        "error" -> err
+        "transfer" -> "$currentName（$files/$totalFiles）"
+        else -> peerName
+    }
+
+    /** 主界面状态条用的一行文案。 */
+    fun statusText(): String = when (phase) {
+        "transfer" -> "$verb $files/$totalFiles · $currentName"
+        "done" -> "${verb}完成 · $files 个文件"
+        "rejected" -> "对方拒绝了本次传输"
+        "error" -> "出错: $err"
+        else -> "${verb}中…"
+    }
+}
+
+/**
+ * TransferOverlay 是全屏传输遮罩：半透明蒙层 + 居中卡片，展示进度环、文件名与统计。
+ * 传输/接收进行中盖住整个界面，避免误操作；完成/被拒/出错短暂停留后由外部收起。
+ */
+@androidx.compose.runtime.Composable
+private fun TransferOverlay(info: TransferInfo) {
+    val tint = when (info.phase) {
+        "done" -> OnlineGreen
+        "rejected", "error" -> Color(0xFFD63B5A)
+        else -> AccentTeal
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0x73000000))
+            // 吞掉点击，禁止穿透到底层界面。
+            .clickable(enabled = true, onClick = {}),
+        contentAlignment = Alignment.Center,
+    ) {
+        Card(
+            modifier = Modifier
+                .width(300.dp)
+                .padding(24.dp),
+            colors = CardDefaults.cardColors(containerColor = CreamSurface),
+            shape = RoundedCornerShape(20.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(28.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                // 进度环。
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(96.dp)) {
+                    if (info.isTerminal()) {
+                        Text(
+                            when (info.phase) {
+                                "done" -> "✓"
+                                "rejected" -> "✕"
+                                else -> "!"
+                            },
+                            color = tint,
+                            fontSize = 44.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    } else {
+                        CircularProgressIndicator(
+                            progress = { info.fraction().coerceAtLeast(0.02f) },
+                            modifier = Modifier.size(96.dp),
+                            color = tint,
+                            strokeWidth = 8.dp,
+                            trackColor = CreamSeparator,
+                        )
+                        Text(
+                            "${(info.fraction() * 100).toInt()}%",
+                            color = tint,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(info.title(), color = InkForeground, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                    if (info.peerName.isNotEmpty() && info.phase != "rejected") {
+                        Spacer(Modifier.height(4.dp))
+                        Text(info.peerName, color = MutedForeground, fontSize = 13.sp)
+                    }
+                    val sub = info.subtitle()
+                    if (sub.isNotEmpty()) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(sub, color = MutedForeground, fontSize = 13.sp)
+                    }
+                }
+
+                if (!info.isTerminal()) {
+                    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        LinearProgressIndicator(
+                            progress = { info.fraction() },
+                            modifier = Modifier.fillMaxWidth(),
+                            color = tint,
+                            trackColor = CreamSeparator,
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("${(info.fraction() * 100).toInt()}%", color = tint, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                            Text("${humanBytes(info.bytes)} / ${humanBytes(info.totalBytes)}", color = MutedForeground, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * TransferNotifier 把传输进度写到系统下拉通知栏。
+ *
+ * - transfer 阶段：一条 ongoing（不可滑动清除）的进度通知，随进度更新进度条；
+ * - done / rejected / error：更新为终态文案并去掉进度条，改为可清除、几秒后自动消失。
+ *
+ * 无通知权限（用户拒绝）时静默降级，不影响传输本身。
+ */
+private class TransferNotifier(private val context: Context) {
+    private val manager = NotificationManagerCompat.from(context)
+
+    init {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID, "文件传输进度", NotificationManager.IMPORTANCE_LOW,
+            ).apply { description = "HopDrop 发送/接收文件时在通知栏展示进度" }
+            val sys = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            sys.createNotificationChannel(channel)
+        }
+    }
+
+    fun update(info: TransferInfo) {
+        if (!hasPermission()) return
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("HopDrop · ${info.title()}")
+            .setContentText(if (info.subtitle().isNotEmpty()) info.subtitle() else info.peerName)
+            .setOnlyAlertOnce(true)
+
+        if (info.isTerminal()) {
+            // 终态：去掉进度条，允许滑动清除，几秒后自动消失。
+            builder.setProgress(0, 0, false)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setTimeoutAfter(4000)
+            builder.setSmallIcon(
+                if (info.phase == "done") android.R.drawable.stat_sys_download_done
+                else android.R.drawable.stat_notify_error
+            )
+        } else {
+            // 进行中：ongoing 进度条。总字节已知时用百分比，未知时用不确定进度。
+            val indeterminate = info.totalBytes <= 0 && info.totalFiles <= 0
+            builder.setOngoing(true)
+                .setProgress(100, (info.fraction() * 100).toInt(), indeterminate)
+            builder.setSmallIcon(
+                if (info.direction == "send") android.R.drawable.stat_sys_upload
+                else android.R.drawable.stat_sys_download
+            )
+        }
+
+        try {
+            manager.notify(NOTIF_ID, builder.build())
+        } catch (e: SecurityException) {
+            // 权限在运行期被撤销等极端情况，忽略即可。
+        }
+    }
+
+    fun cancel() {
+        try {
+            manager.cancel(NOTIF_ID)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun hasPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        return ContextCompat.checkSelfPermission(
+            context, Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "hopdrop_transfer"
+        private const val NOTIF_ID = 1001
+    }
 }
 
 /**

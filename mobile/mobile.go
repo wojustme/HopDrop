@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"sync"
 
 	"github.com/xurenhe/hopdrop/core/device"
@@ -104,6 +105,10 @@ func NewClient(name, platform, idDir string, sink Sink, cb Callback) (*Client, e
 		offers: make(map[string]chan protocol.Decision),
 	}
 	c.node = syncpkg.NewNode(name, platformOf(platform), deviceID, &sinkAdapter{sink: sink})
+	// 移动端不在 Go 里做组播发现（iOS 需 multicast 授权）。改用手动后端：
+	// 由各系统原生 Bonjour（iOS NWBrowser / Android NsdManager）把发现到的 peer
+	// 通过 AddPeer/RemovePeer 喂进来；TCP 传输引擎仍复用同一份核心。
+	c.node.SetDiscovery(syncpkg.DiscoveryManual)
 	c.node.OnPeer(func(discovery.PeerEvent) { c.emitPeers() })
 	c.node.OnDecision(c.handleOffer)
 	c.node.OnProgress(func(p syncpkg.Progress) { c.emitProgress(p) })
@@ -128,8 +133,80 @@ func (c *Client) SelfJSON() string {
 	return string(b)
 }
 
+// SelfName 返回本机设备名，便于宿主直接展示在界面上。
+func (c *Client) SelfName() string { return c.node.Self().Name }
+
+// SelfPlatform 返回本机平台（"ios"/"android"/…）。
+func (c *Client) SelfPlatform() string { return string(c.node.Self().Platform) }
+
+// SelfSyncPort 返回本机接收 TCP 连接的端口（Start 后有效）。
+func (c *Client) SelfSyncPort() int { return c.node.Self().SyncPort }
+
+// LocalEndpointsJSON 返回本机可被对端直连的候选 "host:port" 端点列表（JSON 数组），
+// 供手动配对：宿主可展示这些端点或据首个端点生成配对二维码。私网地址排在最前。
+func (c *Client) LocalEndpointsJSON() string {
+	port := c.node.Self().SyncPort
+	ips := discovery.LocalIPv4s()
+	eps := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		eps = append(eps, fmt.Sprintf("%s:%d", ip, port))
+	}
+	b, _ := json.Marshal(eps)
+	return string(b)
+}
+
+// PairingURI 返回一个可编码进二维码的配对串：
+//
+//	hopdrop://<host:port>?id=<设备ID>&name=<设备名>&platform=<平台>
+//
+// 对端扫码后既可解析出 host:port 直连发送，也可用 id/name/platform 把本机登记为一台
+// 在线设备（AddDiscoveredPeer），从而在列表里持久显示、走正常发送流程。无可用地址时返回空串。
+func (c *Client) PairingURI() string {
+	ips := discovery.LocalIPv4s()
+	if len(ips) == 0 {
+		return ""
+	}
+	self := c.node.Self()
+	endpoint := fmt.Sprintf("%s:%d", ips[0], self.SyncPort)
+	return fmt.Sprintf("hopdrop://%s?id=%s&name=%s&platform=%s",
+		endpoint, url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform)
+}
+
 // PeersJSON 主动返回当前在线设备列表（[]PeerJSON 的 JSON 编码）。
 func (c *Client) PeersJSON() string { return c.peersJSON() }
+
+// ---- 原生 Bonjour 发现喂入（供 iOS NWBrowser / Android NsdManager 调用）----
+//
+// 移动端把"发现"交给系统原生服务完成，解析到的每台设备通过 AddDiscoveredPeer 灌入；
+// 服务消失时用 RemoveDiscoveredPeer 移除；网络切换等场景可用 ClearDiscoveredPeers 清空。
+
+// AddDiscoveredPeer 新增/更新一个被原生发现层解析出的 peer。
+//
+//	id        对端稳定设备 ID（来自 TXT 记录 "id"）。
+//	name      对端设备名。
+//	platform  对端平台（"ios"/"android"/"macos"…）。
+//	addr      对端 IP 地址（IPv4/IPv6 字符串）。
+//	port      对端 TCP 同步端口（来自 Bonjour 服务端口）。
+func (c *Client) AddDiscoveredPeer(id, name, platform, addr string, port int) {
+	if mb := c.node.ManualDiscovery(); mb != nil {
+		mb.AddPeer(id, name, platform, addr, port)
+	}
+}
+
+// RemoveDiscoveredPeer 移除一个离线的 peer（原生检测到服务消失时调用）。
+func (c *Client) RemoveDiscoveredPeer(id string) {
+	if mb := c.node.ManualDiscovery(); mb != nil {
+		mb.RemovePeer(id)
+	}
+}
+
+// ClearDiscoveredPeers 清空全部已发现 peer（如原生浏览器重启/网络切换）。
+func (c *Client) ClearDiscoveredPeers() {
+	if mb := c.node.ManualDiscovery(); mb != nil {
+		mb.Clear()
+	}
+}
+
 
 // Respond 由宿主在收到 OnOffer 并让用户决定后调用，accept 表示是否接收。
 func (c *Client) Respond(offerID string, accept bool) {

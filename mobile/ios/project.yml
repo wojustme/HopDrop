@@ -1,0 +1,59 @@
+name: HopDrop
+options:
+  bundleIdPrefix: com.hopdrop
+  deploymentTarget:
+    iOS: "16.1"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: V596LHQ89S
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+
+targets:
+  HopDrop:
+    type: application
+    platform: iOS
+    sources:
+      - path: HopDropApp.swift
+      - path: HopDropView.swift
+      - path: HopDropController.swift
+      - path: HopDropLiveActivity.swift
+      - path: HopDropActivityAttributes.swift
+      - path: HopDropPairing.swift
+      - path: HopDropBonjour.swift
+      - path: Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hopdrop.ios
+        PRODUCT_MODULE_NAME: HopDropApp
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # 组播授权需 Apple 人工审批后才能进描述文件；批准前先不挂 entitlements，
+        # 否则设备签名会失败。审批通过后取消下一行注释即可。
+        # CODE_SIGN_ENTITLEMENTS: HopDrop.entitlements
+    dependencies:
+      - framework: ../../build/ios/HopDrop.xcframework
+        embed: true
+      - target: HopDropWidget
+
+  HopDropWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widget/HopDropWidgetBundle.swift
+      - path: HopDropActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hopdrop.ios.widget
+        PRODUCT_MODULE_NAME: HopDropWidget
+        INFOPLIST_FILE: Widget/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
