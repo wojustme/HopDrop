@@ -21,10 +21,6 @@ import (
 	"github.com/xurenhe/hopdrop/core/protocol"
 )
 
-// MetaDir 是相册/工作目录下存放 HopDrop 元数据（设备 ID 等）的隐藏目录名。
-// 导出以便 CLI / 桌面端复用同一约定，避免各处硬编码字符串。
-const MetaDir = ".hopdrop"
-
 // Source 表示一次发送的文件来源。实现需保证方法可被多个 goroutine 并发调用。
 type Source interface {
 	// List 返回本次要发送的全部文件元数据（不含内容）。每个 FileMeta.ID

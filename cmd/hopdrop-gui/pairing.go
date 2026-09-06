@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"image/color"
+	"net/url"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -19,9 +21,9 @@ import (
 
 // showPairing 弹出手动配对面板：展示本机二维码 + 直连端点，并提供「按端点发送」入口。
 //
-// 组播被限制（如对端是未授权的 iOS）时，手动配对可绕过发现、直连 TCP 传输：
+// Bonjour 不可用时，手动配对可绕过发现、直连 HTTPS 传输：
 //   - 对端扫本机二维码即可向本机发送；
-//   - 本机在此输入对端 "host:port" 亦可主动发送。
+//   - 本机粘贴对端完整配对串亦可主动发送，并固定校验其 TLS 指纹。
 func (u *ui) showPairing() {
 	endpoint := u.localEndpoint()
 	uri := u.pairingURI()
@@ -39,12 +41,13 @@ func (u *ui) showPairing() {
 
 	epLabel := widget.NewLabelWithStyle(endpoint, fyne.TextAlign(1), fyne.TextStyle{Bold: true, Monospace: true})
 
-	// 「按端点发送」输入区。
+	// 粘贴完整配对串，端点和 TLS 指纹会一起校验。
 	epEntry := widget.NewEntry()
-	epEntry.SetPlaceHolder("对方地址，如 192.168.1.9:47772")
+	epEntry.SetPlaceHolder("hopdrop://… 配对串")
 	sendBtn := widget.NewButtonWithIcon("选文件发送", theme.MailSendIcon(), func() {
-		target := epEntry.Text
-		if target == "" {
+		endpoint, fingerprint, parseErr := directTarget(epEntry.Text)
+		if parseErr != nil {
+			dialog.ShowError(parseErr, u.win)
 			return
 		}
 		dialog.ShowFileOpen(func(rc fyne.URIReadCloser, err error) {
@@ -53,7 +56,7 @@ func (u *ui) showPairing() {
 			}
 			path := rc.URI().Path()
 			rc.Close()
-			u.startSendEndpoint(target, []string{path})
+			u.startSendEndpoint(endpoint, fingerprint, []string{path})
 		}, u.win)
 	})
 	sendBtn.Importance = widget.HighImportance
@@ -68,7 +71,7 @@ func (u *ui) showPairing() {
 		epLabel,
 		newMutedLabel("扫码后本机会出现在手机的设备列表里，可直接互传。", false),
 		widget.NewSeparator(),
-		newMutedLabel("或手动输入对方地址后发送：", false),
+		newMutedLabel("或粘贴对方的完整配对串后发送：", false),
 		epEntry,
 		sendBtn,
 	)
@@ -94,14 +97,14 @@ func (u *ui) showPairing() {
 }
 
 // startSendEndpoint 向一个 "host:port" 直连端点发送（不依赖发现记录）。
-func (u *ui) startSendEndpoint(endpoint string, paths []string) {
+func (u *ui) startSendEndpoint(endpoint, fingerprint string, paths []string) {
 	fyne.Do(func() {
 		u.setStatus("正在直连发送到 "+endpoint+" …", statusBusy)
 		u.progress.SetValue(0)
 		u.progress.Show()
 	})
 	go func() {
-		err := u.node.SendToEndpoint(context.Background(), endpoint, paths)
+		err := u.node.SendToEndpoint(context.Background(), endpoint, fingerprint, paths)
 		fyne.Do(func() {
 			if err != nil {
 				u.progress.Hide()
@@ -110,6 +113,18 @@ func (u *ui) startSendEndpoint(endpoint string, paths []string) {
 			}
 		})
 	}()
+}
+
+func directTarget(raw string) (string, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "hopdrop" || u.Host == "" {
+		return "", "", fmt.Errorf("请输入完整的 hopdrop:// 配对串")
+	}
+	fingerprint := u.Query().Get("fingerprint")
+	if fingerprint == "" {
+		return "", "", fmt.Errorf("配对串缺少设备指纹")
+	}
+	return u.Host, fingerprint, nil
 }
 
 // qrImage 用 boombuler/barcode 生成一张 size×size 的黑白二维码图片；content 为空返回 nil。

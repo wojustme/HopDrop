@@ -12,10 +12,11 @@ import "github.com/xurenhe/hopdrop/core/protocol"
 
 // peerDevice 是设备身份的可序列化形式。
 type peerDevice struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Platform string `json:"platform"`
-	SyncPort int    `json:"sync_port"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Platform    string `json:"platform"`
+	SyncPort    int    `json:"sync_port"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 // peerJSON 是一台在线设备（含网络地址）的可序列化形式。
@@ -58,10 +59,11 @@ type progressJSON struct {
 
 func toPeerDevice(d protocol.DeviceInfo) peerDevice {
 	return peerDevice{
-		ID:       d.ID,
-		Name:     d.Name,
-		Platform: string(d.Platform),
-		SyncPort: d.SyncPort,
+		ID:          d.ID,
+		Name:        d.Name,
+		Platform:    string(d.Platform),
+		SyncPort:    d.SyncPort,
+		Fingerprint: d.Fingerprint,
 	}
 }
 

@@ -4,26 +4,28 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/xurenhe/hopdrop/core/device"
 	"github.com/xurenhe/hopdrop/core/discovery"
-	"github.com/xurenhe/hopdrop/core/protocol"
 	syncpkg "github.com/xurenhe/hopdrop/core/sync"
 )
 
 // cmdSend 把一批本地文件/目录发送给某台设备。
 //
 // 目标可通过 --to 指定：
-//   - "host:port"（含冒号）：直连该端点，跳过发现。
+//   - "hopdrop://..."：按二维码配对信息直连并校验证书指纹。
+//   - "host:port" + --fingerprint：显式直连。
 //   - 其他字符串：作为设备名/前缀，在发现到的在线设备里匹配。
 //
 // 不带 --to 时，会先发现一段时间并列出在线设备让用户按序号选择。
 func cmdSend(args []string) {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
-	to := fs.String("to", "", "目标设备名/前缀，或 host:port 直连端点")
+	to := fs.String("to", "", "目标设备名/前缀、hopdrop:// 配对串，或 host:port")
+	fingerprint := fs.String("fingerprint", "", "直连端点的 SHA-256 设备指纹")
 	name := fs.String("name", defaultName()+"-send", "本端设备名")
 	timeout := fs.Int("timeout", 6, "发现在线设备的等待时长（秒）")
 	_ = fs.Parse(args)
@@ -40,15 +42,11 @@ func cmdSend(args []string) {
 		}
 	}
 
-	self := protocol.DeviceInfo{
-		ID:       device.NewID(),
-		Name:     *name,
-		Platform: currentPlatform(),
+	identity, err := device.NewIdentity("")
+	if err != nil {
+		fatal(err)
 	}
-	// 发送端也需要一个 sink 占位（不会被用到，因为我们只主动发送）。
-	node := syncpkg.NewNode(self.Name, self.Platform, self.ID, nil)
-	// 与接收端一致，用标准 mDNS 发现。
-	node.SetDiscovery(syncpkg.DiscoveryMDNS)
+	node := syncpkg.NewNode(*name, currentPlatform(), identity, nil)
 	node.OnProgress(func(p syncpkg.Progress) {
 		if p.Direction != "send" {
 			return
@@ -73,7 +71,7 @@ func cmdSend(args []string) {
 		}
 	})
 
-	if err := node.Start(0); err != nil {
+	if err := node.StartClient(); err != nil {
 		fatal(err)
 	}
 	defer node.Stop()
@@ -81,8 +79,12 @@ func cmdSend(args []string) {
 	ctx := context.Background()
 
 	// 直连端点：形如 host:port。
-	if *to != "" && strings.Contains(*to, ":") && !looksLikeName(*to) {
-		if err := node.SendToEndpoint(ctx, *to, paths); err != nil {
+	if *to != "" && (strings.HasPrefix(*to, "hopdrop://") || strings.Contains(*to, ":") && !looksLikeName(*to)) {
+		endpoint, pinned, err := directTarget(*to, *fingerprint)
+		if err != nil {
+			fatal(err)
+		}
+		if err := node.SendToEndpoint(ctx, endpoint, pinned, paths); err != nil {
 			fatal(err)
 		}
 		return
@@ -97,6 +99,24 @@ func cmdSend(args []string) {
 	if err := node.SendPaths(ctx, peer, paths); err != nil {
 		fatal(err)
 	}
+}
+
+func directTarget(raw, fallbackFingerprint string) (string, string, error) {
+	if !strings.HasPrefix(raw, "hopdrop://") {
+		if fallbackFingerprint == "" {
+			return "", "", fmt.Errorf("直连必须同时提供 --fingerprint，或直接粘贴 hopdrop:// 配对串")
+		}
+		return raw, fallbackFingerprint, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", "", fmt.Errorf("无效配对串 %q", raw)
+	}
+	fingerprint := u.Query().Get("fingerprint")
+	if fingerprint == "" {
+		return "", "", fmt.Errorf("配对串缺少设备指纹")
+	}
+	return u.Host, fingerprint, nil
 }
 
 // discoverTarget 在超时时间内发现在线设备：

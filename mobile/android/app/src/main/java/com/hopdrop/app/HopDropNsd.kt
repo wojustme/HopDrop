@@ -4,13 +4,12 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
-import java.net.Inet4Address
 
 /**
  * HopDropNsd 用 Android 系统的 NsdManager（网络服务发现 / 底层就是标准 mDNS-DNS/SD）
  * 做局域网设备发现，替代在 Go 里自开组播。
  *
- * 与 iOS(NWBrowser/NWListener)、桌面(Go mDNS) 用同一个服务类型 `_hopdrop._tcp`，
+ * 与 iOS(NWBrowser/NetService)、桌面(Go mDNS) 用同一个服务类型 `_hopdrop._tcp`，
  * 因此三端能互相发现。设备身份放在 TXT 记录：id / name / platform。
  *
  * 关键点：真正发组播的是 Android 系统服务，App 只调 API —— 无需自己持 MulticastLock，
@@ -26,10 +25,11 @@ class HopDropNsd(
     private val selfId: String,
     private val selfName: String,
     private val selfPlatform: String,
+    private val selfFingerprint: String,
     private val port: Int,
 ) {
-    /** 解析出一台设备（含 IP:port）时回调：id/name/platform/host/port。 */
-    var onResolved: ((String, String, String, String, Int) -> Unit)? = null
+    /** 解析出一台设备时回调：id/name/platform/fingerprint/host/port。 */
+    var onResolved: ((String, String, String, String, String, Int) -> Unit)? = null
     /** 一台设备离线（服务消失）时回调：id。 */
     var onRemoved: ((String) -> Unit)? = null
 
@@ -75,6 +75,7 @@ class HopDropNsd(
             setAttribute("id", selfId)
             setAttribute("name", selfName)
             setAttribute("platform", selfPlatform)
+            setAttribute("fingerprint", selfFingerprint)
         }
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {}
@@ -135,19 +136,19 @@ class HopDropNsd(
             override fun onServiceResolved(info: NsdServiceInfo) {
                 resolving.remove(info.serviceName)
                 val host = info.host ?: return
-                // 只接受 IPv4，避免 link-local IPv6 无法直连。
-                val addr = if (host is Inet4Address) host.hostAddress else host.hostAddress
+                val addr = host.hostAddress
                 if (addr.isNullOrEmpty()) return
 
-                val (id, name, platform) = readTxt(info)
-                val realId = id.ifEmpty { info.serviceName }
+                val txt = readTxt(info)
+                val realId = txt.id.ifEmpty { info.serviceName }
                 if (realId == selfId) return
 
                 nameToId[info.serviceName] = realId
                 onResolved?.invoke(
                     realId,
-                    name.ifEmpty { info.serviceName },
-                    platform,
+                    txt.name.ifEmpty { info.serviceName },
+                    txt.platform,
+                    txt.fingerprint,
                     addr,
                     info.port,
                 )
@@ -156,17 +157,25 @@ class HopDropNsd(
         runCatching { nsd.resolveService(service, resolveListener) }
     }
 
-    /** readTxt 从服务的 TXT 属性里取出 id/name/platform。 */
-    private fun readTxt(info: NsdServiceInfo): Triple<String, String, String> {
+    private data class IdentityTxt(
+        val id: String,
+        val name: String,
+        val platform: String,
+        val fingerprint: String,
+    )
+
+    private fun readTxt(info: NsdServiceInfo): IdentityTxt {
         var id = ""
         var name = ""
         var platform = ""
+        var fingerprint = ""
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             val attrs = info.attributes ?: emptyMap()
             id = attrs["id"]?.let { String(it) } ?: ""
             name = attrs["name"]?.let { String(it) } ?: ""
             platform = attrs["platform"]?.let { String(it) } ?: ""
+            fingerprint = attrs["fingerprint"]?.let { String(it) } ?: ""
         }
-        return Triple(id, name, platform)
+        return IdentityTxt(id, name, platform, fingerprint)
     }
 }

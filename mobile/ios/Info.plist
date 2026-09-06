@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<!-- 允许 Live Activity（灵动岛 / 锁屏进度） -->
@@ -44,13 +44,12 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 
-	<!-- iOS 14+ 访问本地网络（含组播）需用户授权 -->
+	<!-- iOS 14+ 使用 Bonjour 与局域网 HTTPS 需用户授权 -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>HopDrop 需要访问本地网络以发现附近设备并传输文件</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_hopdrop._tcp</string>
-		<string>_hopdrop._udp</string>
 	</array>
 
 	<!-- 扫码配对需要相机 -->

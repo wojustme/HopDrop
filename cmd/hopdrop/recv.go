@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/xurenhe/hopdrop/core/device"
 	"github.com/xurenhe/hopdrop/core/discovery"
@@ -39,18 +40,16 @@ func cmdRecv(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	deviceID, err := device.LoadOrCreateID(filepath.Join(abs, filestore.MetaDir, "device_id"))
+	identity, err := device.LoadOrCreateIdentity(identityPath())
 	if err != nil {
 		fatal(err)
 	}
 
-	node := syncpkg.NewNode(*name, currentPlatform(), deviceID, sink)
-	// 桌面/CLI 用标准 mDNS 发现，能与 iOS Bonjour / Android NsdManager 互通。
-	node.SetDiscovery(syncpkg.DiscoveryMDNS)
+	node := syncpkg.NewNode(*name, currentPlatform(), identity, sink)
 
 	// 决策回调：--yes 直接全收；否则在终端里询问。
 	var askMu sync.Mutex
-	node.OnDecision(func(peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
+	node.OnDecision(func(_ context.Context, peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
 		if *yes {
 			fmt.Printf("\n[recv] 接受来自 %s 的 %d 个文件（%s）\n", peer.Name, len(offer.Files), humanBytes(offer.TotalBytes))
 			return protocol.Decision{Accept: true}
@@ -87,12 +86,12 @@ func cmdRecv(args []string) {
 		}
 	})
 
-	if err := node.Start(*port); err != nil {
+	if err := node.StartServer(*port); err != nil {
 		fatal(err)
 	}
 	self := node.Self()
-	fmt.Printf("HopDrop 接收端已启动\n  设备: %s (%s)\n  下载目录: %s\n  监听: :%d\n  自动接受: %v\n\n等待其他设备发送… 按 Ctrl-C 退出。\n\n",
-		self.Name, self.ID[:8], abs, self.SyncPort, *yes)
+	fmt.Printf("HopDrop 接收端已启动\n  设备: %s (%s)\n  下载目录: %s\n  监听: :%d\n  指纹: %s\n  配对串: %s\n  自动接受: %v\n\n等待其他设备发送… 按 Ctrl-C 退出。\n\n",
+		self.Name, self.ID[:8], abs, self.SyncPort, self.Fingerprint, pairingURI(self), *yes)
 
 	waitForSignal()
 	fmt.Println("\n正在退出…")
@@ -105,30 +104,25 @@ func cmdPeers(args []string) {
 	timeout := fs.Int("timeout", 10, "监听时长（秒）")
 	_ = fs.Parse(args)
 
-	self := protocol.DeviceInfo{
-		ID:       device.NewID(),
-		Name:     *name,
-		Platform: currentPlatform(),
-	}
-	disc := discovery.New(self)
-	if err := disc.Start(); err != nil {
+	identity, err := device.NewIdentity("")
+	if err != nil {
 		fatal(err)
 	}
-	defer disc.Stop()
+	node := syncpkg.NewNode(*name, currentPlatform(), identity, nil)
+	if err := node.StartClient(); err != nil {
+		fatal(err)
+	}
+	defer node.Stop()
 
 	fmt.Printf("正在监听局域网内的 HopDrop 设备（%d 秒）…\n\n", *timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), durationSeconds(*timeout))
 	defer cancel()
-	events := disc.Events()
 	for {
 		select {
 		case <-ctx.Done():
-			printPeers(disc.Peers())
+			printPeers(node.Peers())
 			return
-		case ev := <-events:
-			if ev.Online {
-				fmt.Printf("发现: %s (%s @ %s)\n", ev.Peer.Device.Name, ev.Peer.Device.Platform, ev.Peer.SyncEndpoint())
-			}
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }

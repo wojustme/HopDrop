@@ -23,12 +23,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
+	"path/filepath"
 	"sync"
 
 	"github.com/xurenhe/hopdrop/core/device"
 	"github.com/xurenhe/hopdrop/core/discovery"
-	"github.com/xurenhe/hopdrop/core/filestore"
 	"github.com/xurenhe/hopdrop/core/protocol"
 	syncpkg "github.com/xurenhe/hopdrop/core/sync"
 )
@@ -58,6 +59,8 @@ type Sink interface {
 	Write(handle string, data []byte) error
 	// Close 关闭句柄，完成落地（error 非 nil 表示失败，应清理半份文件）。
 	Close(handle string) error
+	// Abort 放弃句柄并删除尚未完成的文件。
+	Abort(handle string) error
 }
 
 // Source 是宿主实现的发送取源接口，用于从相册/沙盒读取要发送的文件。
@@ -96,7 +99,10 @@ type Client struct {
 //	sink       宿主提供的接收落地实现（收到文件时写入）。
 //	cb         事件回调。
 func NewClient(name, platform, idDir string, sink Sink, cb Callback) (*Client, error) {
-	deviceID, err := device.LoadOrCreateID(idDir + "/" + filestore.MetaDir + "_device_id")
+	if name == "" || idDir == "" || sink == nil {
+		return nil, fmt.Errorf("mobile: name, id directory and sink are required")
+	}
+	identity, err := device.LoadOrCreateIdentity(filepath.Join(idDir, "hopdrop-identity-v1.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +110,11 @@ func NewClient(name, platform, idDir string, sink Sink, cb Callback) (*Client, e
 		cb:     cb,
 		offers: make(map[string]chan protocol.Decision),
 	}
-	c.node = syncpkg.NewNode(name, platformOf(platform), deviceID, &sinkAdapter{sink: sink})
+	c.node = syncpkg.NewNode(name, platformOf(platform), identity, &sinkAdapter{sink: sink})
 	// 移动端不在 Go 里做组播发现（iOS 需 multicast 授权）。改用手动后端：
 	// 由各系统原生 Bonjour（iOS NWBrowser / Android NsdManager）把发现到的 peer
 	// 通过 AddPeer/RemovePeer 喂进来；TCP 传输引擎仍复用同一份核心。
-	c.node.SetDiscovery(syncpkg.DiscoveryManual)
+	c.node.UseManualDiscovery()
 	c.node.OnPeer(func(discovery.PeerEvent) { c.emitPeers() })
 	c.node.OnDecision(c.handleOffer)
 	c.node.OnProgress(func(p syncpkg.Progress) { c.emitProgress(p) })
@@ -117,7 +123,7 @@ func NewClient(name, platform, idDir string, sink Sink, cb Callback) (*Client, e
 
 // Start 启动监听与发现。port 传 0 表示自动分配。
 func (c *Client) Start(port int) error {
-	if err := c.node.Start(port); err != nil {
+	if err := c.node.StartServer(port); err != nil {
 		return err
 	}
 	c.emitPeers()
@@ -146,10 +152,13 @@ func (c *Client) SelfSyncPort() int { return c.node.Self().SyncPort }
 // 供手动配对：宿主可展示这些端点或据首个端点生成配对二维码。私网地址排在最前。
 func (c *Client) LocalEndpointsJSON() string {
 	port := c.node.Self().SyncPort
-	ips := discovery.LocalIPv4s()
+	if port <= 0 {
+		return "[]"
+	}
+	ips := discovery.LocalAddresses()
 	eps := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		eps = append(eps, fmt.Sprintf("%s:%d", ip, port))
+		eps = append(eps, net.JoinHostPort(ip, fmt.Sprint(port)))
 	}
 	b, _ := json.Marshal(eps)
 	return string(b)
@@ -157,19 +166,23 @@ func (c *Client) LocalEndpointsJSON() string {
 
 // PairingURI 返回一个可编码进二维码的配对串：
 //
-//	hopdrop://<host:port>?id=<设备ID>&name=<设备名>&platform=<平台>
+//	hopdrop://<host:port>?id=<设备ID>&name=<设备名>&platform=<平台>&fingerprint=<SHA-256>
 //
 // 对端扫码后既可解析出 host:port 直连发送，也可用 id/name/platform 把本机登记为一台
 // 在线设备（AddDiscoveredPeer），从而在列表里持久显示、走正常发送流程。无可用地址时返回空串。
 func (c *Client) PairingURI() string {
-	ips := discovery.LocalIPv4s()
+	ips := discovery.LocalAddresses()
 	if len(ips) == 0 {
 		return ""
 	}
 	self := c.node.Self()
-	endpoint := fmt.Sprintf("%s:%d", ips[0], self.SyncPort)
-	return fmt.Sprintf("hopdrop://%s?id=%s&name=%s&platform=%s",
-		endpoint, url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform)
+	if self.SyncPort <= 0 || self.Fingerprint == "" {
+		return ""
+	}
+	endpoint := net.JoinHostPort(ips[0], fmt.Sprint(self.SyncPort))
+	return fmt.Sprintf("hopdrop://%s?id=%s&name=%s&platform=%s&fingerprint=%s",
+		endpoint, url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform,
+		url.QueryEscape(self.Fingerprint))
 }
 
 // PeersJSON 主动返回当前在线设备列表（[]PeerJSON 的 JSON 编码）。
@@ -187,9 +200,9 @@ func (c *Client) PeersJSON() string { return c.peersJSON() }
 //	platform  对端平台（"ios"/"android"/"macos"…）。
 //	addr      对端 IP 地址（IPv4/IPv6 字符串）。
 //	port      对端 TCP 同步端口（来自 Bonjour 服务端口）。
-func (c *Client) AddDiscoveredPeer(id, name, platform, addr string, port int) {
+func (c *Client) AddDiscoveredPeer(id, name, platform, fingerprint, addr string, port int) {
 	if mb := c.node.ManualDiscovery(); mb != nil {
-		mb.AddPeer(id, name, platform, addr, port)
+		mb.AddPeer(id, name, platform, fingerprint, addr, port)
 	}
 }
 
@@ -207,7 +220,6 @@ func (c *Client) ClearDiscoveredPeers() {
 	}
 }
 
-
 // Respond 由宿主在收到 OnOffer 并让用户决定后调用，accept 表示是否接收。
 func (c *Client) Respond(offerID string, accept bool) {
 	c.mu.Lock()
@@ -221,6 +233,9 @@ func (c *Client) Respond(offerID string, accept bool) {
 
 // SendToDevice 把 src 中的文件发送给设备 ID 为 deviceID 的在线 peer。
 func (c *Client) SendToDevice(deviceID string, src Source) error {
+	if src == nil {
+		return fmt.Errorf("mobile: source is required")
+	}
 	var target *discovery.Peer
 	for _, p := range c.node.Peers() {
 		if p.Device.ID == deviceID {
@@ -236,14 +251,16 @@ func (c *Client) SendToDevice(deviceID string, src Source) error {
 }
 
 // SendToEndpoint 直连一个 "host:port" 端点发送（用于扫码/手动输入地址等场景）。
-func (c *Client) SendToEndpoint(endpoint string, src Source) error {
-	// 复用 Node 的发送路径需要 peer；这里直接借助引擎的端点发送封装。
-	return c.node.SendToEndpointSource(context.Background(), endpoint, &sourceAdapter{src: src})
+func (c *Client) SendToEndpoint(endpoint, fingerprint string, src Source) error {
+	if src == nil {
+		return fmt.Errorf("mobile: source is required")
+	}
+	return c.node.SendToEndpointSource(context.Background(), endpoint, fingerprint, &sourceAdapter{src: src})
 }
 
 // ---- 内部：事件与回调 ----
 
-func (c *Client) handleOffer(peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
+func (c *Client) handleOffer(ctx context.Context, peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
 	c.mu.Lock()
 	c.offerSeq++
 	offerID := fmt.Sprintf("offer-%d", c.offerSeq)
@@ -262,10 +279,17 @@ func (c *Client) handleOffer(peer protocol.DeviceInfo, offer protocol.Offer) pro
 		b, _ := json.Marshal(oj)
 		c.cb.OnOffer(offerID, string(b))
 	} else {
-		// 无回调时默认接受，避免卡死。
-		return protocol.Decision{Accept: true}
+		return protocol.Decision{Accept: false, Reason: "receiver confirmation is unavailable"}
 	}
-	return <-ch
+	select {
+	case decision := <-ch:
+		return decision
+	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.offers, offerID)
+		c.mu.Unlock()
+		return protocol.Decision{Accept: false, Reason: "request canceled"}
+	}
 }
 
 func (c *Client) emitPeers() {
@@ -331,23 +355,33 @@ func (a *sinkAdapter) Create(meta protocol.FileMeta, content io.Reader) error {
 		return err
 	}
 	buf := make([]byte, 128<<10)
+	var written int64
 	for {
 		n, rerr := content.Read(buf)
 		if n > 0 {
 			if werr := a.sink.Write(handle, buf[:n]); werr != nil {
-				_ = a.sink.Close(handle)
+				_ = a.sink.Abort(handle)
 				return werr
 			}
+			written += int64(n)
 		}
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
-			_ = a.sink.Close(handle)
+			_ = a.sink.Abort(handle)
 			return rerr
 		}
 	}
-	return a.sink.Close(handle)
+	if written != meta.Size {
+		_ = a.sink.Abort(handle)
+		return fmt.Errorf("mobile: wrote %d bytes, expected %d", written, meta.Size)
+	}
+	if err := a.sink.Close(handle); err != nil {
+		_ = a.sink.Abort(handle)
+		return err
+	}
+	return nil
 }
 
 // sourceAdapter 把宿主的分块 Source 适配成 filestore.Source。

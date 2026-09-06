@@ -12,6 +12,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -78,12 +79,14 @@ func main() {
 	if err != nil {
 		dialog.ShowError(err, w)
 	}
-	deviceID, _ := device.LoadOrCreateID(filepath.Join(u.downloadDir, filestore.MetaDir, "device_id"))
+	identity, err := device.LoadOrCreateIdentity(desktopIdentityPath())
+	if err != nil {
+		dialog.ShowError(err, w)
+		return
+	}
 	name := deviceName()
 
-	u.node = syncpkg.NewNode(name, currentPlatform(), deviceID, sink)
-	// 桌面端用标准 mDNS 发现，能与 iOS Bonjour / Android NsdManager 互通。
-	u.node.SetDiscovery(syncpkg.DiscoveryMDNS)
+	u.node = syncpkg.NewNode(name, currentPlatform(), identity, sink)
 	u.node.OnPeer(func(ev discovery.PeerEvent) { u.refreshPeers() })
 	u.node.OnDecision(u.onDecision)
 	u.node.OnProgress(u.onProgress)
@@ -105,8 +108,8 @@ const defaultSyncPort = 47772
 
 // startNode 先尝试固定端口，占用时回退随机端口。
 func (u *ui) startNode() error {
-	if err := u.node.Start(defaultSyncPort); err != nil {
-		return u.node.Start(0)
+	if err := u.node.StartServer(defaultSyncPort); err != nil {
+		return u.node.StartServer(0)
 	}
 	return nil
 }
@@ -216,22 +219,23 @@ func (u *ui) buildHeader(name string, self protocol.DeviceInfo) fyne.CanvasObjec
 
 // localEndpoint 返回本机首个可直连的 "host:port"（供手动配对展示）；无地址时返回占位。
 func (u *ui) localEndpoint() string {
-	ips := discovery.LocalIPv4s()
+	ips := discovery.LocalAddresses()
 	if len(ips) == 0 {
 		return "无局域网地址"
 	}
-	return fmt.Sprintf("%s:%d", ips[0], u.node.Self().SyncPort)
+	return net.JoinHostPort(ips[0], fmt.Sprint(u.node.Self().SyncPort))
 }
 
 // pairingURI 返回本机配对串，供二维码编码。带上 id 便于扫码方把本机登记为在线设备。
 func (u *ui) pairingURI() string {
-	ips := discovery.LocalIPv4s()
+	ips := discovery.LocalAddresses()
 	if len(ips) == 0 {
 		return ""
 	}
 	self := u.node.Self()
-	return fmt.Sprintf("hopdrop://%s:%d?id=%s&name=%s&platform=%s",
-		ips[0], self.SyncPort, url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform)
+	return fmt.Sprintf("hopdrop://%s?id=%s&name=%s&platform=%s&fingerprint=%s",
+		net.JoinHostPort(ips[0], fmt.Sprint(self.SyncPort)), url.QueryEscape(self.ID), url.QueryEscape(self.Name), self.Platform,
+		url.QueryEscape(self.Fingerprint))
 }
 
 // refreshPeers 从 node 拉取最新在线设备并刷新列表（在 UI 线程安全地更新）。
@@ -309,15 +313,19 @@ func (u *ui) startSend(target discovery.Peer, paths []string) {
 }
 
 // onDecision 在后台收到 Offer 时被调用；这里同步弹窗等待用户点击接受/拒绝。
-func (u *ui) onDecision(peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
+func (u *ui) onDecision(ctx context.Context, peer protocol.DeviceInfo, offer protocol.Offer) protocol.Decision {
 	ch := make(chan bool, 1)
 	msg := fmt.Sprintf("%s 想给你发送 %d 个文件（共 %s）。\n是否接收到:\n%s ？",
 		peer.Name, len(offer.Files), humanBytes(offer.TotalBytes), u.downloadDir)
 	fyne.Do(func() {
 		dialog.ShowConfirm("收到文件传输", msg, func(ok bool) { ch <- ok }, u.win)
 	})
-	accept := <-ch
-	return protocol.Decision{Accept: accept}
+	select {
+	case accept := <-ch:
+		return protocol.Decision{Accept: accept}
+	case <-ctx.Done():
+		return protocol.Decision{Accept: false, Reason: "request canceled"}
+	}
 }
 
 func (u *ui) onProgress(p syncpkg.Progress) {
@@ -371,8 +379,7 @@ func (u *ui) chooseDownloadDir() {
 		// 重建 node 让新的 sink 生效。
 		u.node.Stop()
 		self := u.node.Self()
-		u.node = syncpkg.NewNode(self.Name, self.Platform, self.ID, sink)
-		u.node.SetDiscovery(syncpkg.DiscoveryMDNS)
+		u.node = syncpkg.NewNode(self.Name, self.Platform, u.node.Identity(), sink)
 		u.node.OnPeer(func(ev discovery.PeerEvent) { u.refreshPeers() })
 		u.node.OnDecision(u.onDecision)
 		u.node.OnProgress(u.onProgress)
@@ -389,6 +396,13 @@ func defaultDownloadDir() string {
 		return d
 	}
 	return filepath.Join(os.TempDir(), "HopDrop")
+}
+
+func desktopIdentityPath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "HopDrop", "identity-v1.json")
+	}
+	return filepath.Join(os.TempDir(), "HopDrop", "identity-v1.json")
 }
 
 func deviceName() string {

@@ -7,10 +7,9 @@ options:
 
 settings:
   base:
-    DEVELOPMENT_TEAM: V596LHQ89S
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "3"
     SWIFT_VERSION: "5.0"
 
 targets:
@@ -35,9 +34,6 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # 组播授权需 Apple 人工审批后才能进描述文件；批准前先不挂 entitlements，
-        # 否则设备签名会失败。审批通过后取消下一行注释即可。
-        # CODE_SIGN_ENTITLEMENTS: HopDrop.entitlements
     dependencies:
       - framework: ../../build/ios/HopDrop.xcframework
         embed: true

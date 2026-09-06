@@ -17,7 +17,7 @@ import (
 const serviceName = "_hopdrop._tcp"
 
 // MDNSBackend 用标准 mDNS/DNS-SD 做设备发现：注册一条 _hopdrop._tcp 服务广播自身，
-// 并周期性浏览同类服务，把设备身份放在 TXT 记录里（id/name/platform）。
+// 并周期性浏览同类服务，把设备身份和 TLS 指纹放在 TXT 记录里。
 //
 // 相比自研组播，它是业界标准协议：能与 Apple Bonjour、Android NsdManager 直接互通，
 // 过路由也更稳。用于桌面端（macOS/Windows/Linux）。
@@ -34,7 +34,7 @@ type MDNSBackend struct {
 	wg     sync.WaitGroup
 }
 
-// NewMDNS 构造一个 mDNS 发现后端。self.SyncPort 必须是实际监听的 TCP 端口。
+// NewMDNS 构造一个 mDNS 发现后端。SyncPort 大于零时同时发布服务；为零时只浏览。
 func NewMDNS(self protocol.DeviceInfo) *MDNSBackend {
 	return &MDNSBackend{
 		self:     self,
@@ -49,25 +49,20 @@ func (m *MDNSBackend) Events() <-chan PeerEvent { return m.events }
 
 // Start 注册本机服务并启动浏览与过期清理循环。
 func (m *MDNSBackend) Start() error {
-	// 注册自身服务：实例名用设备 ID（保证唯一），TXT 携带 name/platform/id。
-	// hostName / IPs 留空，交给库从操作系统推断。
-	svc, err := mdns.NewMDNSService(
-		m.self.ID,       // 实例名（唯一）
-		serviceName,     // 服务类型
-		"",              // domain 默认 local.
-		"",              // hostName 由库自动取 os.Hostname()
-		m.self.SyncPort, // 服务端口
-		nil,             // IPs 由库自动填充本机地址
-		m.txtRecords(),
-	)
-	if err != nil {
-		return fmt.Errorf("discovery(mdns): new service: %w", err)
+	// A client-only node browses without advertising a fake port.
+	if m.self.SyncPort > 0 {
+		svc, err := mdns.NewMDNSService(
+			m.self.ID, serviceName, "", "", m.self.SyncPort, nil, m.txtRecords(),
+		)
+		if err != nil {
+			return fmt.Errorf("discovery(mdns): new service: %w", err)
+		}
+		srv, err := mdns.NewServer(&mdns.Config{Zone: svc})
+		if err != nil {
+			return fmt.Errorf("discovery(mdns): new server: %w", err)
+		}
+		m.srv = srv
 	}
-	srv, err := mdns.NewServer(&mdns.Config{Zone: svc})
-	if err != nil {
-		return fmt.Errorf("discovery(mdns): new server: %w", err)
-	}
-	m.srv = srv
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
@@ -116,6 +111,7 @@ func (m *MDNSBackend) txtRecords() []string {
 		"id=" + m.self.ID,
 		"name=" + m.self.Name,
 		"platform=" + string(m.self.Platform),
+		"fingerprint=" + m.self.Fingerprint,
 	}
 }
 
@@ -152,8 +148,6 @@ func (m *MDNSBackend) browseOnce(ctx context.Context) {
 	if params.Timeout <= 0 {
 		params.Timeout = time.Second
 	}
-	// 只用 IPv4，避免部分环境下 IPv6 组播噪声（与自研路径一致）。
-	params.DisableIPv6 = true
 	_ = mdns.Query(params)
 	close(entries)
 	<-done
@@ -161,10 +155,19 @@ func (m *MDNSBackend) browseOnce(ctx context.Context) {
 
 // handleEntry 把一条 mDNS 服务记录转成 Peer；忽略自己与信息不全的记录。
 func (m *MDNSBackend) handleEntry(e *mdns.ServiceEntry) {
-	if e == nil || e.AddrV4 == nil || e.Port == 0 {
+	if e == nil || e.Port == 0 {
 		return
 	}
-	id, name, platform := parseTXT(e.InfoFields)
+	address := e.AddrV4
+	if address == nil || address.IsLinkLocalUnicast() {
+		address = e.AddrV6
+	}
+	// ServiceEntry does not carry an IPv6 interface zone. A link-local IPv6
+	// literal without that zone cannot be dialed, so wait for a usable address.
+	if address == nil || address.IsLinkLocalUnicast() {
+		return
+	}
+	id, name, platform, fingerprint := parseTXT(e.InfoFields)
 	if id == "" {
 		// 退回用实例名（我们注册时实例名就是设备 ID）。
 		id = trimInstance(e.Name)
@@ -172,27 +175,31 @@ func (m *MDNSBackend) handleEntry(e *mdns.ServiceEntry) {
 	if id == "" || id == m.self.ID {
 		return
 	}
+	if err := protocol.ValidateFingerprint(fingerprint); err != nil {
+		return
+	}
 	dev := protocol.DeviceInfo{
-		ID:       id,
-		Name:     name,
-		Platform: protocol.Platform(platform),
-		SyncPort: e.Port,
+		ID:          id,
+		Name:        name,
+		Platform:    protocol.Platform(platform),
+		SyncPort:    e.Port,
+		Fingerprint: fingerprint,
 	}
 	if dev.Name == "" {
 		dev.Name = id
 	}
-	m.upsert(dev, e.AddrV4.String())
+	m.upsert(dev, address.String())
 }
 
 func (m *MDNSBackend) upsert(dev protocol.DeviceInfo, addr string) {
 	now := time.Now()
 	m.mu.Lock()
-	_, existed := m.peers[dev.ID]
+	previous, existed := m.peers[dev.ID]
 	p := Peer{Device: dev, Addr: addr, LastSeen: now}
 	m.peers[dev.ID] = p
 	m.mu.Unlock()
 
-	if !existed {
+	if !existed || previous.Device != dev || previous.Addr != addr {
 		m.emit(PeerEvent{Online: true, Peer: p})
 	}
 }
@@ -229,8 +236,7 @@ func (m *MDNSBackend) emit(ev PeerEvent) {
 	}
 }
 
-// parseTXT 从 DNS-SD TXT 字段（["id=..","name=..","platform=.."]）解析出三元组。
-func parseTXT(fields []string) (id, name, platform string) {
+func parseTXT(fields []string) (id, name, platform, fingerprint string) {
 	for _, f := range fields {
 		k, v, ok := strings.Cut(f, "=")
 		if !ok {
@@ -243,6 +249,8 @@ func parseTXT(fields []string) (id, name, platform string) {
 			name = v
 		case "platform":
 			platform = v
+		case "fingerprint":
+			fingerprint = v
 		}
 	}
 	return

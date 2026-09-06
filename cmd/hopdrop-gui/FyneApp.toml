@@ -1,12 +1,12 @@
 Icon = "Icon.png"
 Name = "HopDrop"
 ID = "com.hopdrop.desktop"
-Version = "0.1.0"
-Build = 1
+Version = "0.3.0"
+Build = 3
 
 [Details]
   Icon = "Icon.png"
   Name = "HopDrop"
   ID = "com.hopdrop.desktop"
-  Version = "0.1.0"
-  Build = 1
+  Version = "0.3.0"
+  Build = 3

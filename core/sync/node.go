@@ -2,32 +2,25 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 
+	"github.com/xurenhe/hopdrop/core/device"
 	"github.com/xurenhe/hopdrop/core/discovery"
 	"github.com/xurenhe/hopdrop/core/filestore"
 	"github.com/xurenhe/hopdrop/core/protocol"
 )
 
-// Node 把"设备发现 + 接收服务 + 主动发送"编排成一个开箱即用的整体，
-// 是 CLI、桌面端（Fyne）与移动端绑定层共同复用的高层入口。
-//
-// 启动后 Node 会：
-//   - 监听一个 TCP 端口，接受入站传输（收到 Offer 时通过 DecisionFunc 决策）；
-//   - 通过可插拔的发现后端发现局域网内的其他设备（供上层选择发送目标）。
-//
-// 发现后端由 DiscoveryKind 选择：
-//   - DiscoveryMulticast：自研 UDP 组播（默认，单元测试与老路径）；
-//   - DiscoveryMDNS：标准 mDNS/DNS-SD（桌面端，能与 Bonjour/NsdManager 互通）；
-//   - DiscoveryManual：不自行发现，peer 由外部（移动端原生 Bonjour）喂入。
-//
-// 发送由上层主动触发：调用 SendPaths / SendSource 把文件推送给某个 peer。
+// Node is a LAN transfer endpoint. For each transfer the receiver is an HTTPS
+// server and the sender is its client. Reversing the transfer reverses those
+// roles; there is no second wire protocol.
 type Node struct {
-	self     protocol.DeviceInfo
-	sink     filestore.Sink
-	discKind DiscoveryKind
+	self            protocol.DeviceInfo
+	identity        *device.Identity
+	sink            filestore.Sink
+	manualDiscovery bool
 
 	engine *Engine
 	disc   discovery.Backend
@@ -38,176 +31,253 @@ type Node struct {
 	decide     DecisionFunc
 
 	mu     sync.Mutex
+	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-// DiscoveryKind 选择 Node 使用的发现后端。
-type DiscoveryKind int
-
-const (
-	// DiscoveryMulticast 使用自研 UDP 组播（默认）。
-	DiscoveryMulticast DiscoveryKind = iota
-	// DiscoveryMDNS 使用标准 mDNS/DNS-SD。
-	DiscoveryMDNS
-	// DiscoveryManual 不自行发现，peer 由外部喂入（AddPeer/RemovePeer）。
-	DiscoveryManual
-)
-
-// NewNode 构造一个 Node。name/platform 描述本设备；sink 为接收落地目标
-// （只发不收的场景可传 nil，但那样将拒绝入站文件）。默认使用组播发现，
-// 需要其它后端时在 Start 前调用 SetDiscovery。
-func NewNode(name string, platform protocol.Platform, deviceID string, sink filestore.Sink) *Node {
+// NewNode creates a node around a stable cryptographic identity. Pass nil only
+// for an intentionally ephemeral identity, such as an isolated test.
+func NewNode(name string, platform protocol.Platform, identity *device.Identity, sink filestore.Sink) *Node {
 	return &Node{
-		self: protocol.DeviceInfo{
-			ID:       deviceID,
-			Name:     name,
-			Platform: platform,
-		},
+		self:     protocol.DeviceInfo{Name: name, Platform: platform},
+		identity: identity,
 		sink:     sink,
-		discKind: DiscoveryMulticast,
 	}
 }
 
-// SetDiscovery 选择发现后端，必须在 Start 之前调用。
-func (n *Node) SetDiscovery(kind DiscoveryKind) { n.discKind = kind }
-
-// OnProgress 注册传输进度回调（可选）。
-func (n *Node) OnProgress(fn ProgressFunc) { n.onProgress = fn }
-
-// OnPeer 注册 peer 上/下线回调（可选）。
-func (n *Node) OnPeer(fn func(discovery.PeerEvent)) { n.onPeer = fn }
-
-// OnDecision 注册收到 Offer 时的决策回调（可选，nil 表示默认全部接受）。
-// 必须在 Start 之前设置。
-func (n *Node) OnDecision(fn DecisionFunc) { n.decide = fn }
-
-// Self 返回本设备身份（Start 之后 SyncPort 会被填成实际端口）。
-func (n *Node) Self() protocol.DeviceInfo { return n.self }
-
-// Start 绑定 TCP 端口、启动接收服务与设备发现。port 传 0 表示由系统分配。
-func (n *Node) Start(port int) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return fmt.Errorf("sync: listen tcp: %w", err)
-	}
-	n.ln = ln
-	n.self.SyncPort = ln.Addr().(*net.TCPAddr).Port
-
-	n.engine = NewEngine(n.self, n.sink, n.decide)
-	n.disc = n.newBackend()
-
-	ctx, cancel := context.WithCancel(context.Background())
+// UseManualDiscovery delegates Bonjour/NSD discovery to the native mobile UI.
+// Desktop nodes use mDNS automatically.
+func (n *Node) UseManualDiscovery() {
 	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.manualDiscovery = true
+}
+
+func (n *Node) OnProgress(fn ProgressFunc) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.onProgress = fn
+}
+
+func (n *Node) OnPeer(fn func(discovery.PeerEvent)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.onPeer = fn
+}
+
+func (n *Node) OnDecision(fn DecisionFunc) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.decide = fn
+}
+
+func (n *Node) Self() protocol.DeviceInfo {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.self
+}
+
+func (n *Node) Identity() *device.Identity {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.identity
+}
+
+// StartServer opens the HTTPS receive server and advertises it. A port of zero
+// asks the OS for an available port.
+func (n *Node) StartServer(port int) error {
+	return n.start(true, port)
+}
+
+// StartClient starts only discovery and the HTTPS client. It does not open or
+// advertise an inbound port, which is useful for a send-only process.
+func (n *Node) StartClient() error {
+	return n.start(false, 0)
+}
+
+func (n *Node) start(serve bool, port int) error {
+	n.mu.Lock()
+	if n.cancel != nil {
+		n.mu.Unlock()
+		return errors.New("sync: node is already running")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n.ctx = ctx
 	n.cancel = cancel
+	identity := n.identity
+	self := n.self
 	n.mu.Unlock()
 
-	if err := n.disc.Start(); err != nil {
+	fail := func(err error) error {
 		cancel()
-		_ = ln.Close()
+		n.mu.Lock()
+		if n.ctx == ctx {
+			n.ctx, n.cancel, n.disc, n.ln, n.engine = nil, nil, nil, nil, nil
+			n.self.SyncPort = 0
+		}
+		n.mu.Unlock()
 		return err
 	}
 
-	n.wg.Add(2)
+	if identity == nil {
+		var err error
+		identity, err = device.NewIdentity("")
+		if err != nil {
+			return fail(err)
+		}
+		n.mu.Lock()
+		n.identity = identity
+		n.mu.Unlock()
+	}
+	cert, err := identity.TLSCertificate(self.Name)
+	if err != nil {
+		return fail(err)
+	}
+	var ln net.Listener
+	if serve {
+		ln, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return fail(fmt.Errorf("sync: listen: %w", err))
+		}
+	}
+
+	n.mu.Lock()
+	self.ID = identity.ID
+	self.Fingerprint = identity.Fingerprint()
+	self.SyncPort = 0
+	if serve {
+		self.SyncPort = ln.Addr().(*net.TCPAddr).Port
+	}
+	n.self = self
+	n.ln = ln
+	n.engine = NewEngine(self, n.sink, n.decide, cert)
+	if n.manualDiscovery {
+		n.disc = discovery.NewManual(self.ID)
+	} else {
+		n.disc = discovery.NewMDNS(self)
+	}
+	engine, backend := n.engine, n.disc
+	onProgress, onPeer := n.onProgress, n.onPeer
+	n.mu.Unlock()
+
+	if err := backend.Start(); err != nil {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return fail(fmt.Errorf("sync: start discovery: %w", err))
+	}
+
+	n.wg.Add(1)
+	if serve {
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			if err := engine.Serve(ctx, ln, onProgress); err != nil {
+				report(onProgress, Progress{Direction: "recv", Phase: "error", Err: err.Error()})
+			}
+		}()
+	}
 	go func() {
 		defer n.wg.Done()
-		_ = n.engine.Serve(ctx, ln, n.onProgress)
-	}()
-	go func() {
-		defer n.wg.Done()
-		n.discoveryLoop(ctx)
+		n.discoveryLoop(ctx, backend, onPeer)
 	}()
 	return nil
 }
 
-// Stop 停止发现、关闭监听并等待后台 goroutine 退出。
 func (n *Node) Stop() {
 	n.mu.Lock()
-	cancel := n.cancel
-	n.cancel = nil
+	cancel, backend, ln := n.cancel, n.disc, n.ln
+	n.ctx, n.cancel, n.disc, n.ln, n.engine = nil, nil, nil, nil, nil
 	n.mu.Unlock()
 	if cancel == nil {
 		return
 	}
 	cancel()
-	if n.disc != nil {
-		n.disc.Stop()
+	if backend != nil {
+		backend.Stop()
 	}
-	if n.ln != nil {
-		_ = n.ln.Close()
+	if ln != nil {
+		_ = ln.Close()
 	}
 	n.wg.Wait()
 }
 
-// Peers 返回当前在线 peer 快照。
 func (n *Node) Peers() []discovery.Peer {
-	if n.disc == nil {
+	n.mu.Lock()
+	backend := n.disc
+	n.mu.Unlock()
+	if backend == nil {
 		return nil
 	}
-	return n.disc.Peers()
+	return backend.Peers()
 }
 
-// newBackend 依据 discKind 构造对应的发现后端。
-func (n *Node) newBackend() discovery.Backend {
-	switch n.discKind {
-	case DiscoveryMDNS:
-		return discovery.NewMDNS(n.self)
-	case DiscoveryManual:
-		return discovery.NewManual(n.self.ID)
-	default:
-		return discovery.New(n.self)
-	}
-}
-
-// ManualDiscovery 返回底层的手动发现后端（仅当 DiscoveryManual 时非 nil），
-// 供移动端把系统原生 Bonjour 发现到的 peer 喂进来。
 func (n *Node) ManualDiscovery() *discovery.ManualBackend {
-	if mb, ok := n.disc.(*discovery.ManualBackend); ok {
-		return mb
-	}
-	return nil
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	backend, _ := n.disc.(*discovery.ManualBackend)
+	return backend
 }
 
-// SendSource 把一个 filestore.Source 中的文件发送给指定 peer。
-func (n *Node) SendSource(ctx context.Context, p discovery.Peer, src filestore.Source) error {
-	return n.engine.Send(ctx, p.SyncEndpoint(), src, n.onProgress)
+func (n *Node) SendSource(ctx context.Context, peer discovery.Peer, source filestore.Source) error {
+	return n.send(ctx, peer.SyncEndpoint(), peer.Device, source)
 }
 
-// SendPaths 把一批本地文件/文件夹发送给指定 peer（便捷封装）。
-func (n *Node) SendPaths(ctx context.Context, p discovery.Peer, paths []string) error {
-	src, err := filestore.NewLocalSource(paths)
+func (n *Node) SendPaths(ctx context.Context, peer discovery.Peer, paths []string) error {
+	source, err := filestore.NewLocalSource(paths)
 	if err != nil {
 		return err
 	}
-	return n.SendSource(ctx, p, src)
+	return n.SendSource(ctx, peer, source)
 }
 
-// SendToEndpoint 允许在没有发现记录时，直接向一个 "host:port" 端点发送。
-func (n *Node) SendToEndpoint(ctx context.Context, endpoint string, paths []string) error {
-	src, err := filestore.NewLocalSource(paths)
+// SendToEndpoint connects to a QR/manual endpoint. fingerprint is mandatory;
+// accepting an unauthenticated endpoint would make QR pairing misleading.
+func (n *Node) SendToEndpoint(ctx context.Context, endpoint, fingerprint string, paths []string) error {
+	source, err := filestore.NewLocalSource(paths)
 	if err != nil {
 		return err
 	}
-	return n.engine.Send(ctx, endpoint, src, n.onProgress)
+	return n.SendToEndpointSource(ctx, endpoint, fingerprint, source)
 }
 
-// SendToEndpointSource 直连一个 "host:port" 端点，把任意 Source 中的文件发送过去。
-func (n *Node) SendToEndpointSource(ctx context.Context, endpoint string, src filestore.Source) error {
-	return n.engine.Send(ctx, endpoint, src, n.onProgress)
+func (n *Node) SendToEndpointSource(ctx context.Context, endpoint, fingerprint string, source filestore.Source) error {
+	if fingerprint == "" {
+		return errors.New("sync: peer fingerprint is required for direct pairing")
+	}
+	return n.send(ctx, endpoint, protocol.DeviceInfo{Fingerprint: fingerprint}, source)
 }
 
-func (n *Node) discoveryLoop(ctx context.Context) {
-	events := n.disc.Events()
+func (n *Node) send(ctx context.Context, endpoint string, peer protocol.DeviceInfo, source filestore.Source) error {
+	n.mu.Lock()
+	engine := n.engine
+	nodeContext := n.ctx
+	onProgress := n.onProgress
+	n.mu.Unlock()
+	if engine == nil || nodeContext == nil {
+		return errors.New("sync: node is not running")
+	}
+	transferContext, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(nodeContext, cancel)
+	defer func() {
+		stopCancel()
+		cancel()
+	}()
+	return engine.Send(transferContext, endpoint, peer, source, onProgress)
+}
+
+func (n *Node) discoveryLoop(ctx context.Context, backend discovery.Backend, onPeer func(discovery.PeerEvent)) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, ok := <-events:
+		case event, ok := <-backend.Events():
 			if !ok {
 				return
 			}
-			if n.onPeer != nil {
-				n.onPeer(ev)
+			if onPeer != nil {
+				onPeer(event)
 			}
 		}
 	}

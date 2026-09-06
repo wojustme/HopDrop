@@ -5,7 +5,7 @@ import AVFoundation
 /// HopDropPairing 汇集手动配对相关的解析与二维码生成工具。
 ///
 /// 配对串格式（与 mobile.PairingURI 一致）：
-///   hopdrop://<host:port>?id=<设备ID>&name=<设备名>&platform=<平台>
+///   hopdrop://<host:port>?id=...&name=...&platform=...&fingerprint=<SHA-256>
 enum HopDropPairing {
     /// 从配对串解析出的对端信息。
     struct Info {
@@ -14,40 +14,31 @@ enum HopDropPairing {
         let id: String
         let name: String
         let platform: String
-        var endpoint: String { "\(host):\(port)" }
+        let fingerprint: String
+        var endpoint: String { host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)" }
     }
 
-    /// 从配对串里解析出可直连的 "host:port"。非 hopdrop 串直接原样返回（允许用户手输裸端点）。
+    /// 从完整配对串里解析出可直连的 "host:port"。
     static func endpoint(from raw: String) -> String? {
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return nil }
-        guard s.hasPrefix("hopdrop://") else {
-            // 允许直接是 "192.168.1.9:47772" 这样的裸端点。
-            return s.contains(":") ? s : nil
-        }
-        // 去掉 scheme，再截掉 query。
-        var rest = String(s.dropFirst("hopdrop://".count))
-        if let q = rest.firstIndex(of: "?") { rest = String(rest[..<q]) }
-        return rest.isEmpty ? nil : rest
+        info(from: raw)?.endpoint
     }
 
-    /// 完整解析配对串：host/port + id/name/platform。裸端点也能解析（id 为空）。
+    /// 完整解析配对串。TLS 指纹缺失或格式错误时拒绝。
     static func info(from raw: String) -> Info? {
-        guard let ep = endpoint(from: raw) else { return nil }
-        let parts = ep.split(separator: ":")
-        guard parts.count >= 2, let port = Int(parts[parts.count - 1]) else { return nil }
-        let host = parts.dropLast().joined(separator: ":")
-
-        var id = "", name = "", platform = ""
-        if let comps = URLComponents(string: raw), let items = comps.queryItems {
-            id = items.first(where: { $0.name == "id" })?.value ?? ""
-            name = items.first(where: { $0.name == "name" })?.value ?? ""
-            platform = items.first(where: { $0.name == "platform" })?.value ?? ""
+        guard let comps = URLComponents(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              comps.scheme == "hopdrop", let host = comps.host,
+              let port = comps.port, (1...65535).contains(port) else { return nil }
+        let items = comps.queryItems ?? []
+        let id = items.first(where: { $0.name == "id" })?.value ?? ""
+        let name = items.first(where: { $0.name == "name" })?.value ?? ""
+        let platform = items.first(where: { $0.name == "platform" })?.value ?? ""
+        let fingerprint = items.first(where: { $0.name == "fingerprint" })?.value ?? ""
+        guard !id.isEmpty, fingerprint.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil else {
+            return nil
         }
-        // 无 id 时用端点兜底一个稳定 id，保证能登记进列表。
-        if id.isEmpty { id = "manual-\(ep)" }
-        if name.isEmpty { name = host }
-        return Info(host: host, port: port, id: id, name: name, platform: platform)
+        return Info(host: host, port: port, id: id,
+                    name: name.isEmpty ? host : name, platform: platform,
+                    fingerprint: fingerprint.lowercased())
     }
 
     /// 从配对串里解析出对端设备名（用于确认提示），无则返回 nil。
@@ -160,7 +151,7 @@ struct PairingSheet: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
 
-                    Text("组播被系统限制时，扫码可直连传输，无需处于同一发现列表。")
+                    Text("扫码会同时校验对方地址与设备指纹，无需依赖自动发现。")
                         .font(.system(size: 12))
                         .multilineTextAlignment(.center)
                         .foregroundColor(HopDropTheme.muted)

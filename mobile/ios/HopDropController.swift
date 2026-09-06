@@ -39,10 +39,11 @@ final class HopDropController: ObservableObject {
     private let liveActivity = HopDropLiveActivity()
     /// 终态遮罩的延时收起任务，便于被下一条进度取消。
     private var dismissTask: Task<Void, Never>?
-    /// 原生 Bonjour 发现（NWBrowser/NWListener），把发现到的 peer 喂给 Go 侧。
+    /// 原生 Bonjour 发现，把发现到的 peer 喂给 Go 侧。
     private var bonjour: HopDropBonjour?
 
     func start() {
+        guard client == nil else { return }
         let callback = CallbackImpl(owner: self)
         let sink = DocumentSink()
         self.sink = sink
@@ -56,7 +57,14 @@ final class HopDropController: ObservableObject {
             return
         }
         self.client = c
-        try? c.start(0)
+        do {
+            try c.start(0)
+        } catch {
+            print("HopDrop server start failed: \(error)")
+            self.client = nil
+            self.sink = nil
+            return
+        }
         self.selfName = c.selfName()
         self.selfPlatform = c.selfPlatform()
         refreshPairingURI()
@@ -66,16 +74,18 @@ final class HopDropController: ObservableObject {
     /// startBonjour 启动原生 Bonjour 发现，并把结果喂进 MobileClient。
     private func startBonjour(client c: MobileClient) {
         // 用 Go 侧的稳定设备 ID，保证与对端看到的一致、且能过滤掉自己。
-        let selfID = (try? JSONDecoder().decode(PeerDevice.self,
-            from: Data(c.selfJSON().utf8)))?.id ?? UUID().uuidString
+        let selfInfo = try? JSONDecoder().decode(PeerDevice.self, from: Data(c.selfJSON().utf8))
+        let selfID = selfInfo?.id ?? UUID().uuidString
         let b = HopDropBonjour(
             selfID: selfID,
             selfName: c.selfName(),
             selfPlatform: c.selfPlatform(),
+            selfFingerprint: selfInfo?.fingerprint ?? "",
             port: c.selfSyncPort()
         )
-        b.onResolved = { [weak self] id, name, platform, host, port in
-            self?.client?.addDiscoveredPeer(id, name: name, platform: platform, addr: host, port: port)
+        b.onResolved = { [weak self] id, name, platform, fingerprint, host, port in
+            self?.client?.addDiscoveredPeer(id, name: name, platform: platform,
+                                            fingerprint: fingerprint, addr: host, port: port)
         }
         b.onRemoved = { [weak self] id in
             self?.client?.removeDiscoveredPeer(id)
@@ -91,12 +101,12 @@ final class HopDropController: ObservableObject {
     }
 
     /// 直连一个 "host:port" 端点发送（扫码/手动配对场景）。
-    func sendToEndpoint(_ endpoint: String, urls: [URL]) {
+    func sendToEndpoint(_ endpoint: String, fingerprint: String, urls: [URL]) {
         guard let client = client else { return }
         DispatchQueue.global(qos: .userInitiated).async {
             let source = FileSource(urls: urls)
             do {
-                try client.send(toEndpoint: endpoint, src: source)
+                try client.send(toEndpoint: endpoint, fingerprint: fingerprint, src: source)
             } catch {
                 print("HopDrop sendToEndpoint failed: \(error)")
             }
@@ -108,7 +118,7 @@ final class HopDropController: ObservableObject {
     /// 之后走正常「选设备 → 发送」流程；无需再次扫码。
     func registerScanned(_ info: HopDropPairing.Info) {
         client?.addDiscoveredPeer(info.id, name: info.name, platform: info.platform,
-                                  addr: info.host, port: info.port)
+                                  fingerprint: info.fingerprint, addr: info.host, port: info.port)
         selectedId = info.id
     }
 
@@ -116,6 +126,8 @@ final class HopDropController: ObservableObject {
         bonjour?.stop()
         bonjour = nil
         client?.stop()
+        client = nil
+        sink = nil
         liveActivity.finish()
     }
 
@@ -168,7 +180,8 @@ final class HopDropController: ObservableObject {
 
         func onPeers(_ peersJSON: String?) {
             guard let data = peersJSON?.data(using: .utf8),
-                  let list = try? JSONDecoder().decode([PeerDevice].self, from: data) else { return }
+                  let records = try? JSONDecoder().decode([PeerRecord].self, from: data) else { return }
+            let list = records.map(\.device)
             DispatchQueue.main.async {
                 self.owner?.peers = list
                 // 选中的设备若已离线，清空选择。
@@ -201,8 +214,14 @@ final class HopDropController: ObservableObject {
 /// DocumentSink 是 gomobile MobileSink 的实现：把收到的文件写入 App Documents/HopDrop，
 /// 按 rel_path 重建子目录，并做路径穿越防护。用自增 handle 关联已打开的 FileHandle。
 final class DocumentSink: NSObject, MobileSinkProtocol {
+    private struct PendingFile {
+        let file: FileHandle
+        let temporary: URL
+        let destination: URL
+    }
     private let baseDir: URL
-    private var handles: [String: FileHandle] = [:]
+    private let lock = NSLock()
+    private var handles: [String: PendingFile] = [:]
     private var seq = 0
 
     override init() {
@@ -221,16 +240,25 @@ final class DocumentSink: NSObject, MobileSinkProtocol {
         }
         let name = (obj["name"] as? String) ?? "file"
         let rel = (obj["rel_path"] as? String) ?? name
-        let dest = safeDestination(rel: rel, fallback: name)
+        guard let destination = safeDestination(rel: rel) else {
+            error?.pointee = NSError(domain: "HopDrop", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "unsafe relative path"])
+            return ""
+        }
+        let dest = uniqueDestination(destination)
 
         do {
             try FileManager.default.createDirectory(
                 at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: dest.path, contents: nil)
+            let temporary = dest.deletingLastPathComponent()
+                .appendingPathComponent(".hopdrop-\(UUID().uuidString).part")
+            FileManager.default.createFile(atPath: temporary.path, contents: nil)
 
-            let fh = try FileHandle(forWritingTo: dest)
+            let fh = try FileHandle(forWritingTo: temporary)
+            lock.lock()
             let handle = "w\(seq)"; seq += 1
-            handles[handle] = fh
+            handles[handle] = PendingFile(file: fh, temporary: temporary, destination: dest)
+            lock.unlock()
             return handle
         } catch let e as NSError {
             error?.pointee = e
@@ -239,27 +267,59 @@ final class DocumentSink: NSObject, MobileSinkProtocol {
     }
 
     func write(_ handle: String?, data: Data?) throws {
-        guard let h = handle, let fh = handles[h], let d = data else { return }
-        try fh.write(contentsOf: d)
+        guard let h = handle, let d = data else { return }
+        lock.lock(); let pending = handles[h]; lock.unlock()
+        guard let pending = pending else {
+            throw NSError(domain: "HopDrop", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "unknown write handle"])
+        }
+        try pending.file.write(contentsOf: d)
     }
 
     func close(_ handle: String?) throws {
-        guard let h = handle, let fh = handles.removeValue(forKey: h) else { return }
-        try? fh.close()
+        guard let pending = take(handle) else { return }
+        do {
+            try pending.file.synchronize()
+            try pending.file.close()
+            try FileManager.default.moveItem(at: pending.temporary, to: pending.destination)
+        } catch {
+            try? FileManager.default.removeItem(at: pending.temporary)
+            throw error
+        }
     }
 
-    /// safeDestination 把相对路径限制在 baseDir 内，遇到 ".." / 绝对路径等越界情况退回文件名落地。
-    private func safeDestination(rel: String, fallback: String) -> URL {
+    func abort(_ handle: String?) throws {
+        guard let pending = take(handle) else { return }
+        try? pending.file.close()
+        try? FileManager.default.removeItem(at: pending.temporary)
+    }
+
+    private func take(_ handle: String?) -> PendingFile? {
+        guard let handle = handle else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return handles.removeValue(forKey: handle)
+    }
+
+    private func safeDestination(rel: String) -> URL? {
         let comps = rel.split(separator: "/").map(String.init)
-        if rel.hasPrefix("/") || comps.contains("..") {
-            return baseDir.appendingPathComponent(fallback)
-        }
+        if rel.isEmpty || rel.hasPrefix("/") || rel.contains("\\") || comps.contains("..") { return nil }
         let dest = baseDir.appendingPathComponent(rel)
         let baseStd = baseDir.standardizedFileURL.path + "/"
-        if !dest.standardizedFileURL.path.hasPrefix(baseStd) {
-            return baseDir.appendingPathComponent(fallback)
-        }
+        if !dest.standardizedFileURL.path.hasPrefix(baseStd) { return nil }
         return dest
+    }
+
+    private func uniqueDestination(_ url: URL) -> URL {
+        if !FileManager.default.fileExists(atPath: url.path) { return url }
+        let ext = url.pathExtension
+        let stem = url.deletingPathExtension().lastPathComponent
+        let directory = url.deletingLastPathComponent()
+        for index in 1...10000 {
+            let suffix = ext.isEmpty ? "" : ".\(ext)"
+            let candidate = directory.appendingPathComponent("\(stem) (\(index))\(suffix)")
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return directory.appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
     }
 }
 
@@ -282,9 +342,14 @@ final class FileSource: NSObject, MobileSourceProtocol {
             let id = String(i)
             let name = url.lastPathComponent
 
-            var size: Int64 = 0
+            var size: Int64 = -1
             if let vals = try? url.resourceValues(forKeys: [.fileSizeKey]), let s = vals.fileSize {
                 size = Int64(s)
+            }
+            if size < 0,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let number = attrs[.size] as? NSNumber {
+                size = number.int64Value
             }
             var mime = ""
             if let type = UTType(filenameExtension: url.pathExtension),
@@ -351,6 +416,13 @@ struct PeerDevice: Codable, Identifiable {
     let name: String
     let platform: String
     let sync_port: Int
+    let fingerprint: String
+}
+
+private struct PeerRecord: Codable {
+    let device: PeerDevice
+    let addr: String
+    let endpoint: String
 }
 
 struct FileMeta: Codable {
@@ -384,12 +456,12 @@ struct ProgressInfo: Codable {
 /*
 Info.plist 需要声明：
 
-    // iOS 14+ 访问本地网络（含组播）需用户授权
+    // iOS 14+ 使用 Bonjour 与局域网 HTTPS 需用户授权
     <key>NSLocalNetworkUsageDescription</key>
     <string>HopDrop 需要访问本地网络以发现附近设备并传输文件</string>
     <key>NSBonjourServices</key>
     <array>
-        <string>_hopdrop._udp</string>
+        <string>_hopdrop._tcp</string>
     </array>
 
     // 让收到的文件在「文件」App 中可见（可选，便于用户取用 Documents/HopDrop）
@@ -398,5 +470,4 @@ Info.plist 需要声明：
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
 
-组播地址 239.192.71.71:47771 属于本地网络，触发本地网络授权弹窗。
 */

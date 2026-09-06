@@ -1,14 +1,10 @@
 import Foundation
 import Network
 
-/// HopDropBonjour 用 Apple 的 Network framework 做局域网设备发现，替代 Go 侧的组播。
-///
-/// 关键点：iOS 对 App 自开的 UDP 组播需要 com.apple.developer.networking.multicast 授权
-/// （需 Apple 审批）；而走系统 Bonjour（NWListener 广播 + NWBrowser 浏览）只需“本地网络”
-/// 权限即可。因此发现放在原生这一层，传输仍复用 Go 引擎。
+/// HopDropBonjour 用系统 Bonjour 发布 Go HTTPS Server，并通过 NWBrowser 发现对端。
 ///
 /// 服务类型固定 `_hopdrop._tcp`，与桌面(Go mDNS)、Android(NsdManager) 一致，可互相发现。
-/// 设备身份放在 TXT 记录：id / name / platform。
+/// 设备身份放在 TXT 记录：id / name / platform / fingerprint。
 ///
 /// 发现到（并解析出 IP:port）的 peer 通过 onResolved 回调交给上层喂进 MobileClient；
 /// 服务消失通过 onRemoved 回调移除。
@@ -16,7 +12,7 @@ import Network
 final class HopDropBonjour {
     static let serviceType = "_hopdrop._tcp"
 
-    private var listener: NWListener?
+    private var service: NetService?
     private var browser: NWBrowser?
     /// 正在解析中的连接，按服务名持有，避免被释放。
     private var resolving: [String: NWConnection] = [:]
@@ -26,66 +22,56 @@ final class HopDropBonjour {
     private let selfID: String
     private let selfName: String
     private let selfPlatform: String
+    private let selfFingerprint: String
     private let port: UInt16
 
-    /// 解析出一台设备（含 IP:port）时回调；参数依次为 id/name/platform/host/port。
-    var onResolved: ((String, String, String, String, Int) -> Void)?
+    /// 参数依次为 id/name/platform/fingerprint/host/port。
+    var onResolved: ((String, String, String, String, String, Int) -> Void)?
     /// 一台设备离线（服务消失）时回调，参数为设备 ID。
     var onRemoved: ((String) -> Void)?
 
-    init(selfID: String, selfName: String, selfPlatform: String, port: Int) {
+    init(selfID: String, selfName: String, selfPlatform: String,
+         selfFingerprint: String, port: Int) {
         self.selfID = selfID
         self.selfName = selfName
         self.selfPlatform = selfPlatform
+        self.selfFingerprint = selfFingerprint
         self.port = UInt16(max(0, min(port, 65535)))
     }
 
     // MARK: - 生命周期
 
     func start() {
-        startListener()
+        publishService()
         startBrowser()
     }
 
     func stop() {
-        listener?.cancel(); listener = nil
+        service?.stop(); service = nil
         browser?.cancel(); browser = nil
         for (_, c) in resolving { c.cancel() }
         resolving.removeAll()
         nameToID.removeAll()
     }
 
-    // MARK: - 广播自身（NWListener）
+    // MARK: - 广播 Go HTTPS Server 已经占用的端口
 
-    private func startListener() {
+    private func publishService() {
         guard port > 0 else { return }
-        do {
-            let params = NWParameters.tcp
-            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-            // 广播 Bonjour 服务，TXT 携带设备身份。
-            let txt = NWTXTRecord([
-                "id": selfID,
-                "name": selfName,
-                "platform": selfPlatform,
-            ])
-            listener.service = NWListener.Service(
-                name: selfID,             // 实例名用设备 ID，保证唯一
-                type: Self.serviceType,
-                txtRecord: txt.data
-            )
-            // 我们并不用这个 listener 处理数据（真正的接收 socket 在 Go 引擎里），
-            // 但必须接受连接以保持服务健康；直接取消进来的连接即可。
-            listener.newConnectionHandler = { conn in conn.cancel() }
-            listener.stateUpdateHandler = { state in
-                if case let .failed(err) = state {
-                    print("HopDrop Bonjour listener failed: \(err)")
-                }
-            }
-            listener.start(queue: .main)
-            self.listener = listener
-        } catch {
-            print("HopDrop Bonjour listener start error: \(error)")
-        }
+        let published = NetService(
+            domain: "local.", type: Self.serviceType + ".",
+            name: selfID, port: Int32(port)
+        )
+        published.includesPeerToPeer = true
+        let fields = [
+            "id": Data(selfID.utf8),
+            "name": Data(selfName.utf8),
+            "platform": Data(selfPlatform.utf8),
+            "fingerprint": Data(selfFingerprint.utf8),
+        ]
+        published.setTXTRecord(NetService.data(fromTXTRecord: fields))
+        published.publish()
+        service = published
     }
 
     // MARK: - 发现设备（NWBrowser）
@@ -116,11 +102,12 @@ final class HopDropBonjour {
         for result in results {
             guard case let .service(name, type, domain, _) = result.endpoint else { continue }
             // 从 TXT 里取设备身份；忽略自己。
-            var id = name, dev = name, platform = ""
+            var id = name, dev = name, platform = "", fingerprint = ""
             if case let .bonjour(txt) = result.metadata {
                 id = txt["id"] ?? name
                 dev = txt["name"] ?? name
                 platform = txt["platform"] ?? ""
+                fingerprint = txt["fingerprint"] ?? ""
             }
             if id == selfID { continue }
             live.insert(name)
@@ -129,11 +116,12 @@ final class HopDropBonjour {
             // 已在解析中的跳过，避免重复连接。
             if resolving[name] != nil { continue }
             resolve(name: name, type: type, domain: domain,
-                    id: id, deviceName: dev, platform: platform)
+                    id: id, deviceName: dev, platform: platform, fingerprint: fingerprint)
         }
 
         // 处理消失：之前见过、这次不在的服务，回调 onRemoved。
-        for (name, id) in nameToID where !live.contains(name) {
+        let disappeared = nameToID.filter { !live.contains($0.key) }
+        for (name, id) in disappeared {
             resolving[name]?.cancel()
             resolving[name] = nil
             nameToID[name] = nil
@@ -143,7 +131,7 @@ final class HopDropBonjour {
 
     /// resolve 用一个临时 NWConnection 把 Bonjour 服务解析成具体 IP:port。
     private func resolve(name: String, type: String, domain: String,
-                         id: String, deviceName: String, platform: String) {
+                         id: String, deviceName: String, platform: String, fingerprint: String) {
         let endpoint = NWEndpoint.service(name: name, type: type, domain: domain, interface: nil)
         let conn = NWConnection(to: endpoint, using: .tcp)
         resolving[name] = conn
@@ -155,8 +143,8 @@ final class HopDropBonjour {
                 let hp = Self.remoteHostPort(conn)
                 Task { @MainActor in
                     guard let self = self else { return }
-                    if let (host, port) = hp {
-                        self.onResolved?(id, deviceName, platform, host, port)
+                    if self.nameToID[name] == id, let (host, port) = hp {
+                        self.onResolved?(id, deviceName, platform, fingerprint, host, port)
                     }
                     conn.cancel()
                     self.resolving[name] = nil
@@ -184,8 +172,7 @@ final class HopDropBonjour {
             if let v4 = addr.asIPv4 {
                 return (ipv4String(v4), portInt)
             }
-            let raw = "\(addr)"
-            return (raw.components(separatedBy: "%").first ?? raw, portInt)
+            return ("\(addr)", portInt)
         case let .name(n, _):
             return (n, portInt)
         @unknown default:

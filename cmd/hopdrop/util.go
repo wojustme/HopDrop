@@ -2,9 +2,14 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
+	"github.com/xurenhe/hopdrop/core/discovery"
 	"github.com/xurenhe/hopdrop/core/protocol"
 )
 
@@ -20,6 +25,23 @@ func currentPlatform() protocol.Platform {
 	default:
 		return protocol.PlatformCLI
 	}
+}
+
+func pairingURI(self protocol.DeviceInfo) string {
+	addresses := discovery.LocalAddresses()
+	if len(addresses) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("hopdrop://%s?id=%s&name=%s&platform=%s&fingerprint=%s",
+		net.JoinHostPort(addresses[0], fmt.Sprint(self.SyncPort)), url.QueryEscape(self.ID), url.QueryEscape(self.Name),
+		self.Platform, url.QueryEscape(self.Fingerprint))
+}
+
+func identityPath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "HopDrop", "identity-v1.json")
+	}
+	return filepath.Join(os.TempDir(), "HopDrop", "identity-v1.json")
 }
 
 // durationSeconds 把秒数转成 time.Duration。

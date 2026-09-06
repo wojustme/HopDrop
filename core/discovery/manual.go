@@ -19,7 +19,8 @@ type ManualBackend struct {
 	mu    sync.Mutex
 	peers map[string]Peer
 
-	events chan PeerEvent
+	events  chan PeerEvent
+	stopped bool
 }
 
 // NewManual 构造一个手动后端。selfID 用于过滤掉自己（原生偶尔会发现到本机服务）。
@@ -37,14 +38,13 @@ func (b *ManualBackend) Events() <-chan PeerEvent { return b.events }
 // Start 无需启动任何后台循环。
 func (b *ManualBackend) Start() error { return nil }
 
-// Stop 关闭事件通道。
+// Stop marks the backend inactive. The event channel stays immutable so native
+// discovery callbacks racing with application shutdown cannot send on a
+// closed channel.
 func (b *ManualBackend) Stop() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.events != nil {
-		close(b.events)
-		b.events = nil
-	}
+	b.stopped = true
 }
 
 // Peers 返回当前在线 peer 快照。
@@ -60,15 +60,16 @@ func (b *ManualBackend) Peers() []Peer {
 
 // AddPeer 由原生发现层调用：新增/更新一个已解析出地址的 peer。
 // addr 为对端 IPv4/IPv6 字符串，port 为其 TCP 同步端口。
-func (b *ManualBackend) AddPeer(id, name, platform, addr string, port int) {
-	if id == "" || id == b.selfID {
+func (b *ManualBackend) AddPeer(id, name, platform, fingerprint, addr string, port int) {
+	if id == "" || id == b.selfID || protocol.ValidateFingerprint(fingerprint) != nil {
 		return
 	}
 	dev := protocol.DeviceInfo{
-		ID:       id,
-		Name:     name,
-		Platform: protocol.Platform(platform),
-		SyncPort: port,
+		ID:          id,
+		Name:        name,
+		Platform:    protocol.Platform(platform),
+		SyncPort:    port,
+		Fingerprint: fingerprint,
 	}
 	if dev.Name == "" {
 		dev.Name = id
@@ -76,11 +77,15 @@ func (b *ManualBackend) AddPeer(id, name, platform, addr string, port int) {
 	p := Peer{Device: dev, Addr: addr, LastSeen: time.Now()}
 
 	b.mu.Lock()
-	_, existed := b.peers[id]
+	if b.stopped {
+		b.mu.Unlock()
+		return
+	}
+	previous, existed := b.peers[id]
 	b.peers[id] = p
 	b.mu.Unlock()
 
-	if !existed {
+	if !existed || previous.Device != dev || previous.Addr != addr {
 		b.emit(PeerEvent{Online: true, Peer: p})
 	}
 }
@@ -111,9 +116,9 @@ func (b *ManualBackend) Clear() {
 
 func (b *ManualBackend) emit(ev PeerEvent) {
 	b.mu.Lock()
-	ch := b.events
+	ch, stopped := b.events, b.stopped
 	b.mu.Unlock()
-	if ch == nil {
+	if stopped {
 		return
 	}
 	select {

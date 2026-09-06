@@ -11,7 +11,7 @@
 //	# 在发送端列出局域网里的在线设备
 //	hopdrop peers
 //
-//	# 向某台设备发送文件/文件夹（按设备名或前缀匹配，也可用 --to host:port 直连）
+//	# 向某台设备发送文件/文件夹（按设备名匹配，或粘贴 hopdrop:// 配对串）
 //	hopdrop send --to MacA ./photo.jpg ./someDir
 //
 // 单机联调：开两个终端，一个 recv 一个 send，即可在一台机器上验证完整链路。
@@ -48,13 +48,13 @@ func usage() {
 
 用法:
   hopdrop recv  --dir <下载目录> [--name <设备名>] [--port <端口>] [--yes]
-  hopdrop send  [--to <设备名|host:port>] [--name <设备名>] [--timeout <秒>] <文件或目录>...
+  hopdrop send  [--to <设备名|hopdrop://配对串>] [--fingerprint <SHA-256>] <文件或目录>...
   hopdrop peers [--name <设备名>] [--timeout <秒>]
 
 recv   常驻接收：把其他设备推送来的文件落到 <下载目录>。默认会就每次传输询问是否接收，
        加 --yes 则自动接受。
 send   把一批本地文件/目录发送给某台设备。不带 --to 时会列出在线设备让你选择。
-peers  仅广播并监听，打印发现到的设备，用于排查发现是否正常。
+peers  只浏览并打印发现到的接收设备，用于排查 Bonjour/mDNS 是否正常。
 `)
 }
 

@@ -129,6 +129,7 @@ class MainActivity : ComponentActivity() {
     private val showPairingState = mutableStateOf(false)
     /** 扫码得到对端端点后暂存，待用户选文件后直连发送。 */
     private var pendingEndpoint: String? = null
+    private var pendingFingerprint: String? = null
     /** 终态遮罩的延时收起句柄，便于被下一条进度取消。 */
     private var dismissRunnable: Runnable? = null
 
@@ -145,11 +146,12 @@ class MainActivity : ComponentActivity() {
     /** 扫码：调用 zxing-embedded 的扫码 Activity，返回扫到的文本。 */
     private val scanQr = registerForActivityResult(com.journeyapps.barcodescanner.ScanContract()) { result ->
         val text = result.contents ?: return@registerForActivityResult
-        val ep = parsePairingEndpoint(text) ?: run {
+        val pairing = parsePairingInfo(text) ?: run {
             statusState.value = "无法识别的二维码"
             return@registerForActivityResult
         }
-        pendingEndpoint = ep
+        pendingEndpoint = pairing.endpoint
+        pendingFingerprint = pairing.fingerprint
         // 选文件后直连发送。
         pickFilesForEndpoint.launch(arrayOf("*/*"))
     }
@@ -228,11 +230,17 @@ class MainActivity : ComponentActivity() {
             DownloadSink(this),
             callback,
         )
-        client.start(0)
+        val serverStarted = try {
+            client.start(0)
+            true
+        } catch (error: Exception) {
+            statusState.value = "启动失败: ${error.message}"
+            false
+        }
         selfNameState.value = client.selfName()
         selfPlatformState.value = client.selfPlatform()
         pairingUriState.value = client.pairingURI()
-        startNsd()
+        if (serverStarted) startNsd()
 
         setContent {
             MaterialTheme(colorScheme = HopDropColorScheme) {
@@ -305,10 +313,11 @@ class MainActivity : ComponentActivity() {
             selfId = id,
             selfName = client.selfName(),
             selfPlatform = client.selfPlatform(),
+            selfFingerprint = self.optString("fingerprint"),
             port = client.selfSyncPort().toInt(),
         )
-        n.onResolved = { pid, name, platform, addr, port ->
-            client.addDiscoveredPeer(pid, name, platform, addr, port.toLong())
+        n.onResolved = { pid, name, platform, fingerprint, addr, port ->
+            client.addDiscoveredPeer(pid, name, platform, fingerprint, addr, port.toLong())
         }
         n.onRemoved = { pid -> client.removeDiscoveredPeer(pid) }
         n.start()
@@ -329,12 +338,14 @@ class MainActivity : ComponentActivity() {
     /** 扫码得到文件后，直连发送到 pendingEndpoint。 */
     private fun startSendEndpoint(uris: List<Uri>) {
         val endpoint = pendingEndpoint ?: return
+        val fingerprint = pendingFingerprint ?: return
         pendingEndpoint = null
+        pendingFingerprint = null
         statusState.value = "正在直连发送 ${uris.size} 个文件…"
         Thread {
             try {
                 val source = ContentResolverSource(contentResolver, uris)
-                client.sendToEndpoint(endpoint, source)
+                client.sendToEndpoint(endpoint, fingerprint, source)
             } catch (e: Exception) {
                 runOnUiThread { statusState.value = "发送失败: ${e.message}" }
             }
@@ -637,9 +648,9 @@ private fun PairingDialog(
                             .padding(10.dp),
                     )
                     Text(selfName, color = InkForeground, fontSize = 14.sp)
-                    val ep = parsePairingEndpoint(uri)
-                    if (ep != null) {
-                        Text(ep, color = MutedForeground, fontSize = 12.sp)
+                    val pairing = parsePairingInfo(uri)
+                    if (pairing != null) {
+                        Text(pairing.endpoint, color = MutedForeground, fontSize = 12.sp)
                     }
                 } else {
                     Text(
@@ -656,19 +667,17 @@ private fun PairingDialog(
 }
 
 /**
- * parsePairingEndpoint 从配对串解析出可直连的 "host:port"。
- * 支持 hopdrop://host:port?... 与裸 host:port 两种输入。
+ * 配对串同时携带端点和 TLS 指纹，二者缺一不可。
  */
-private fun parsePairingEndpoint(raw: String): String? {
-    val s = raw.trim()
-    if (s.isEmpty()) return null
-    if (!s.startsWith("hopdrop://")) {
-        return if (s.contains(":")) s else null
-    }
-    var rest = s.removePrefix("hopdrop://")
-    val q = rest.indexOf('?')
-    if (q >= 0) rest = rest.substring(0, q)
-    return rest.ifEmpty { null }
+private data class PairingInfo(val endpoint: String, val fingerprint: String)
+
+private fun parsePairingInfo(raw: String): PairingInfo? {
+    val uri = runCatching { android.net.Uri.parse(raw.trim()) }.getOrNull() ?: return null
+    if (uri.scheme != "hopdrop" || uri.host.isNullOrEmpty() || uri.port !in 1..65535) return null
+    val fingerprint = uri.getQueryParameter("fingerprint") ?: return null
+    if (!fingerprint.matches(Regex("[0-9a-fA-F]{64}"))) return null
+    val endpoint = if (uri.host!!.contains(':')) "[${uri.host}]:${uri.port}" else "${uri.host}:${uri.port}"
+    return PairingInfo(endpoint, fingerprint.lowercase())
 }
 
 /** generateQr 用 zxing 生成一张 size×size 的黑白二维码位图。 */
@@ -803,7 +812,7 @@ private fun TransferOverlay(info: TransferInfo) {
                         )
                     } else {
                         CircularProgressIndicator(
-                            progress = { info.fraction().coerceAtLeast(0.02f) },
+                            progress = info.fraction().coerceAtLeast(0.02f),
                             modifier = Modifier.size(96.dp),
                             color = tint,
                             strokeWidth = 8.dp,
@@ -834,7 +843,7 @@ private fun TransferOverlay(info: TransferInfo) {
                 if (!info.isTerminal()) {
                     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         LinearProgressIndicator(
-                            progress = { info.fraction() },
+                            progress = info.fraction(),
                             modifier = Modifier.fillMaxWidth(),
                             color = tint,
                             trackColor = CreamSeparator,
@@ -933,34 +942,62 @@ private class TransferNotifier(private val context: Context) {
  * 用一个自增 handle 关联已打开的 OutputStream。仅面向 Android 10+（MediaStore.Downloads）。
  */
 private class DownloadSink(private val activity: ComponentActivity) : Sink {
-    private val streams = HashMap<String, java.io.OutputStream>()
+    private data class Pending(val uri: Uri, val stream: java.io.OutputStream)
+    private val streams = HashMap<String, Pending>()
     private var seq = 0
 
     override fun openWrite(metaJSON: String): String {
         val meta = JSONObject(metaJSON)
         val name = meta.getString("name")
+        val relPath = meta.getString("rel_path")
+        val parts = relPath.split("/")
+        require(!relPath.startsWith("/") && !relPath.contains('\\') &&
+            parts.isNotEmpty() && parts.last() == name &&
+            parts.none { it.isEmpty() || it == "." || it == ".." }) {
+            "unsafe relative path"
+        }
         val mime = meta.optString("mime_type", "")
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
             if (mime.isNotEmpty()) put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "Download/HopDrop")
+            val subdirectory = parts.dropLast(1).joinToString("/")
+            put(MediaStore.Downloads.RELATIVE_PATH,
+                if (subdirectory.isEmpty()) "Download/HopDrop" else "Download/HopDrop/$subdirectory")
+            put(MediaStore.Downloads.IS_PENDING, 1)
         }
         val resolver = activity.contentResolver
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: throw IllegalStateException("cannot create MediaStore entry for $name")
 
         val handle = "w${seq++}"
-        streams[handle] = resolver.openOutputStream(uri)
-            ?: throw IllegalStateException("cannot open output stream")
+        val stream = try {
+            resolver.openOutputStream(uri)
+                ?: throw IllegalStateException("cannot open output stream")
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+        synchronized(this) { streams[handle] = Pending(uri, stream) }
         return handle
     }
 
     override fun write(handle: String, data: ByteArray) {
-        streams[handle]?.write(data)
+        val pending = synchronized(this) { streams[handle] }
+            ?: throw IllegalStateException("unknown write handle")
+        pending.stream.write(data)
     }
 
     override fun close(handle: String) {
-        streams.remove(handle)?.use { it.flush() }
+        val pending = synchronized(this) { streams.remove(handle) } ?: return
+        pending.stream.use { it.flush() }
+        val values = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+        activity.contentResolver.update(pending.uri, values, null, null)
+    }
+
+    override fun abort(handle: String) {
+        val pending = synchronized(this) { streams.remove(handle) } ?: return
+        runCatching { pending.stream.close() }
+        activity.contentResolver.delete(pending.uri, null, null)
     }
 }
 
@@ -997,11 +1034,12 @@ private class ContentResolverSource(
             if (size < 0) {
                 // 少数 provider 不给 SIZE 列，退回文件描述符长度，确保发送时字节数精确。
                 size = try {
-                    resolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+                    resolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
                 } catch (e: Exception) {
-                    0L
+                    -1L
                 }
             }
+            require(size >= 0) { "cannot determine exact size for $name" }
             val mime = resolver.getType(uri) ?: ""
             val meta = JSONObject().apply {
                 put("id", id)

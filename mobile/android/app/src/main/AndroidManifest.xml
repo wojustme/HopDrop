@@ -4,8 +4,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- 系统 NsdManager 做 mDNS 发现；保留组播状态权限以兼容部分设备 -->
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- Android 13+ 展示通知（下拉通知栏进度）需要运行时授权 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 扫码配对需要相机 -->

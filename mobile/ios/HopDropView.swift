@@ -28,6 +28,7 @@ struct HopDropView: View {
     @State private var showPairing = false
     /// 扫码/配对得到的对端端点；非 nil 时拉起文件选择并直连发送。
     @State private var pendingEndpoint: String?
+    @State private var pendingFingerprint: String?
     /// 直连发送用的文件选择器开关（与设备列表发送分开，避免目标混淆）。
     @State private var showEndpointImporter = false
 
@@ -146,10 +147,11 @@ struct HopDropView: View {
             allowedContentTypes: [.item],
             allowsMultipleSelection: true
         ) { result in
-            guard let ep = pendingEndpoint,
+            guard let ep = pendingEndpoint, let fingerprint = pendingFingerprint,
                   case let .success(urls) = result, !urls.isEmpty else { return }
-            controller.sendToEndpoint(ep, urls: urls)
+            controller.sendToEndpoint(ep, fingerprint: fingerprint, urls: urls)
             pendingEndpoint = nil
+            pendingFingerprint = nil
         }
         // 配对面板：展示本机二维码 + 扫码入口。
         .sheet(isPresented: $showPairing) {
@@ -159,6 +161,7 @@ struct HopDropView: View {
                 if let info = HopDropPairing.info(from: code) {
                     controller.registerScanned(info)
                     pendingEndpoint = info.endpoint
+                    pendingFingerprint = info.fingerprint
                     // 稍延迟以等配对 sheet 完成关闭动画，再拉起文件选择器。
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                         showEndpointImporter = true
@@ -180,7 +183,11 @@ struct HopDropView: View {
     private var offerBinding: Binding<Bool> {
         Binding(
             get: { controller.pendingOffer != nil },
-            set: { if !$0 { controller.pendingOffer = nil } }
+            set: { visible in
+                if !visible, let pending = controller.pendingOffer {
+                    controller.respond(offerId: pending.id, accept: false)
+                }
+            }
         )
     }
 
